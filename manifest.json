@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "AI Browser Assistant",
+  "name": "狐狸学伴",
   "version": "1.3.1",
   "description": "Chat with AI about the current webpage content - supports multiple LLM providers",
   "permissions": [
