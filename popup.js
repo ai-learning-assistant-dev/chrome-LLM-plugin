@@ -668,7 +668,7 @@ function stopStream() {
   statusEl.textContent = '已停止';
 }
 
-// Add message to chat
+// ============ Add Message ============
 function addMessage(role, content) {
   const msg = document.createElement('div');
   msg.className = `message ${role}`;

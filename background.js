@@ -46,6 +46,107 @@ const PROVIDERS = {
 // Track active stream AbortControllers keyed by senderTabId
 const activeStreams = {}; // senderTabId -> AbortController
 
+// ===== Context Menu: Translate Paragraph =====
+// Create context menu item (idempotent - safe to call at startup)
+function setupContextMenu() {
+  // Remove first to avoid duplicates on SW restart
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'translate-paragraph',
+      title: '🌐 翻译此段落',
+      contexts: ['all']
+    });
+  });
+}
+setupContextMenu();
+
+// Handle context menu clicks
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId !== 'translate-paragraph') return;
+  if (!tab || !tab.id) return;
+
+  try {
+    // Step 1: Get LLM config from storage
+    const stored = await chrome.storage.local.get(['provider', 'apiKey', 'model', 'customEndpoint']);
+    const { provider, apiKey, model, customEndpoint } = stored;
+
+    if (!provider || !apiKey) {
+      console.log('[Translation] No API config - user needs to configure first');
+      return;
+    }
+
+    const actualModel = model || (provider === 'custom' ? 'custom-model' : '');
+    const config = { provider, apiKey, model: actualModel, customEndpoint: customEndpoint || '' };
+
+    // Step 2: Get the clicked element's text from content script
+    const elementResp = await chrome.tabs.sendMessage(tab.id, { type: 'GET_CLICKED_ELEMENT_TEXT' });
+    if (!elementResp || !elementResp.text || elementResp.text.trim().length < 5) {
+      console.log('[Translation] No valid text from clicked element');
+      return;
+    }
+
+    const originalText = elementResp.text.trim();
+    console.log('[Translation] Translating:', originalText.substring(0, 80) + '...');
+
+    // Step 3: Insert loading placeholder immediately (before slow LLM call)
+    const placeholderResp = await chrome.tabs.sendMessage(tab.id, { type: 'INSERT_TRANSLATION_PLACEHOLDER' });
+    const placeholderId = (placeholderResp && placeholderResp.placeholderId) ? placeholderResp.placeholderId : -1;
+
+    try {
+      // Step 4: Translate
+      const systemPrompt = `You are a professional translator. Translate the following text into Simplified Chinese (简体中文).
+
+Rules:
+1. Return ONLY the translated text - no explanations, no JSON, no markdown
+2. Preserve the original meaning, tone, and style
+3. If the text is already in Chinese, return it unchanged
+4. If the text is code or a technical term that should not be translated, return it unchanged`;
+
+      const result = await translateBatch(config, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: originalText }
+      ]);
+
+      const translatedText = result.content ? result.content.trim() : '';
+
+      if (!translatedText) {
+        console.log('[Translation] Empty translation result');
+        // Update placeholder with error
+        await chrome.tabs.sendMessage(tab.id, {
+          type: 'UPDATE_TRANSLATION',
+          placeholderId: placeholderId,
+          translatedText: '',
+          error: true
+        }).catch(() => {});
+        return;
+      }
+
+      console.log('[Translation] Result:', translatedText.substring(0, 80) + '...');
+
+      // Step 5: Update the placeholder with real translation
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'UPDATE_TRANSLATION',
+        placeholderId: placeholderId,
+        translatedText: translatedText,
+        error: false
+      });
+
+    } catch (translateError) {
+      console.error('[Translation] Translation error:', translateError);
+      // Update placeholder with error state
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'UPDATE_TRANSLATION',
+        placeholderId: placeholderId,
+        translatedText: '',
+        error: true
+      }).catch(() => {});
+    }
+
+  } catch (error) {
+    console.error('[Translation] Context menu translation error:', error);
+  }
+});
+
 // Handle messages from popup / sidepanel
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'SEND_TO_AI') {
@@ -204,6 +305,49 @@ async function fetchModels(config) {
     console.error('Error fetching models:', error);
     throw error;
   }
+}
+
+// Non-streaming LLM call for translation (returns full response at once)
+async function translateBatch(config, messages) {
+  const { provider, apiKey, model, customEndpoint } = config;
+
+  if (!apiKey) throw new Error('请先填写 API Key');
+  if (!model) throw new Error('请选择模型');
+
+  let endpoint;
+  if (provider === 'custom') {
+    endpoint = customEndpoint;
+    if (!endpoint) throw new Error('请填写自定义 API 端点');
+  } else {
+    endpoint = PROVIDERS[provider].endpoint;
+  }
+
+  const body = {
+    model: model,
+    messages: messages,
+    stream: false
+  };
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    let errorMsg = `API error: ${response.status}`;
+    try {
+      const errorData = await response.json();
+      errorMsg = errorData.error?.message || errorData.message || errorMsg;
+    } catch (e) {}
+    throw new Error(errorMsg);
+  }
+
+  const data = await response.json();
+  return { content: data.choices?.[0]?.message?.content || '' };
 }
 
 async function sendToLLM(config, messages, senderTabId) {

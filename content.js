@@ -12,6 +12,25 @@
       });
       return true; // Keep message channel open for async response
     }
+
+    if (request.type === 'GET_CLICKED_ELEMENT_TEXT') {
+      const result = getClickedElementText();
+      sendResponse(result);
+      return true;
+    }
+
+    if (request.type === 'INSERT_TRANSLATION_PLACEHOLDER') {
+      const placeholderId = insertTranslationPlaceholder();
+      sendResponse({ placeholderId });
+      return true;
+    }
+
+    if (request.type === 'UPDATE_TRANSLATION') {
+      updateTranslationContent(request.placeholderId, request.translatedText, request.error);
+      sendResponse({ success: true });
+      return true;
+    }
+
     return true;
   });
 
@@ -341,6 +360,217 @@ async function extractBilibiliComments() {
   return comments;
 }
 
+  // ========== Immersive Translation ==========
+
+  // State for translation tracking
+  let translationStyleElement = null;
+  let rightClickedElement = null; // Track right-clicked element for context menu
+  let translationIdCounter = 0; // Unique ID for each translation block
+
+  // Track right-clicked element for context menu translation
+  document.addEventListener('contextmenu', function(e) {
+    rightClickedElement = e.target;
+  }, true);
+
+  // Find the nearest block-level text-containing ancestor
+  function findNearestBlockElement(el) {
+    const BLOCK_TAGS = new Set([
+      'P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+      'LI', 'BLOCKQUOTE', 'TD', 'TH', 'FIGCAPTION',
+      'DD', 'DT', 'PRE', 'DIV', 'ARTICLE', 'SECTION',
+      'MAIN', 'ASIDE', 'SUMMARY', 'DETAILS'
+    ]);
+
+    // First try: walk up to find a block-level tag with enough text
+    let current = el;
+    while (current && current !== document.body && current !== document.documentElement) {
+      if (BLOCK_TAGS.has(current.tagName)) {
+        const text = current.textContent.trim();
+        if (text.length >= 5) {
+          return current;
+        }
+      }
+      current = current.parentElement;
+    }
+
+    // Fallback: return the original target if nothing better found
+    return el;
+  }
+
+  // Get text from the right-clicked element's nearest block ancestor
+  function getClickedElementText() {
+    if (!rightClickedElement) {
+      return { text: '' };
+    }
+
+    const blockEl = findNearestBlockElement(rightClickedElement);
+    if (!blockEl) {
+      return { text: '' };
+    }
+
+    // Store for later insertion (overwrite previous)
+    rightClickedElement = blockEl;
+
+    const text = blockEl.textContent.trim();
+    console.log('[AI Browser] Right-clicked element text:', text.substring(0, 100) + '...');
+    return { text: text };
+  }
+
+  // Insert a loading placeholder after the right-clicked element (returns placeholderId)
+  function insertTranslationPlaceholder() {
+    if (!rightClickedElement || !rightClickedElement.isConnected) return -1;
+
+    injectTranslationStyles();
+
+    const originalEl = rightClickedElement;
+    const id = ++translationIdCounter;
+
+    // Remove any existing translation block right after this element
+    const nextSibling = originalEl.nextElementSibling;
+    if (nextSibling && nextSibling.classList.contains('ai-translation-block')) {
+      nextSibling.remove();
+    }
+
+    const translationBlock = document.createElement('div');
+    translationBlock.className = 'ai-translation-block ai-translation-loading';
+    translationBlock.dataset.aiTransId = id;
+    translationBlock.innerHTML =
+      '<div class="ai-translation-header">' +
+        '<span class="ai-translation-label">🌐 中文翻译</span>' +
+        '<button class="ai-translation-delete-btn" data-ai-trans-id="' + id + '">✕ 删除</button>' +
+      '</div>' +
+      '<div class="ai-translation-content">' +
+        '<span class="ai-loading-spinner"></span> 翻译中，请稍候...' +
+      '</div>';
+
+    originalEl.insertAdjacentElement('afterend', translationBlock);
+    console.log('[AI Browser] Inserted translation placeholder, id:', id);
+    return id;
+  }
+
+  // Update a translation placeholder with real content (or error state)
+  function updateTranslationContent(placeholderId, translatedText, isError) {
+    const block = document.querySelector('.ai-translation-block[data-ai-trans-id="' + placeholderId + '"]');
+    if (!block) return;
+
+    block.classList.remove('ai-translation-loading');
+    const contentEl = block.querySelector('.ai-translation-content');
+    if (!contentEl) return;
+
+    if (isError || !translatedText || !translatedText.trim()) {
+      // Show error state
+      contentEl.innerHTML = '<span style="color: #c0392b;">⚠️ 翻译失败，请重试</span>';
+    } else {
+      // Show real translation
+      contentEl.textContent = translatedText;
+    }
+
+    console.log('[AI Browser] Updated translation, id:', placeholderId, 'error:', !!isError);
+  }
+
+  // Event delegation for delete button clicks on translation blocks
+  document.addEventListener('click', function(e) {
+    const deleteBtn = e.target.closest('.ai-translation-delete-btn');
+    if (!deleteBtn) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const translationBlock = deleteBtn.closest('.ai-translation-block');
+    if (translationBlock) {
+      translationBlock.style.transition = 'opacity 0.2s, max-height 0.3s';
+      translationBlock.style.opacity = '0';
+      translationBlock.style.maxHeight = '0';
+      translationBlock.style.margin = '0';
+      translationBlock.style.padding = '0';
+      translationBlock.style.overflow = 'hidden';
+      setTimeout(() => {
+        translationBlock.remove();
+        console.log('[AI Browser] Removed translation block');
+      }, 300);
+    }
+  }, true);
+
+  // Inject CSS styles for translation blocks
+  function injectTranslationStyles() {
+    if (translationStyleElement) return;
+    translationStyleElement = document.createElement('style');
+    translationStyleElement.id = 'ai-immersive-translation-styles';
+    translationStyleElement.textContent = `
+      .ai-translation-block {
+        display: block;
+        margin: 4px 0 14px 0;
+        padding: 10px 14px;
+        background: linear-gradient(135deg, #f0f7ff 0%, #f5f0ff 100%);
+        border-left: 3px solid #6b8fd4;
+        border-radius: 0 6px 6px 0;
+        font-size: 0.92em;
+        line-height: 1.7;
+        color: #444;
+        transition: opacity 0.2s, max-height 0.3s, margin 0.3s, padding 0.3s;
+      }
+      .ai-translation-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 5px;
+      }
+      .ai-translation-block .ai-translation-label {
+        font-size: 0.7em;
+        color: #6b8fd4;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+      }
+      .ai-translation-delete-btn {
+        padding: 2px 8px;
+        background: transparent;
+        border: 1px solid #ccc;
+        border-radius: 3px;
+        color: #999;
+        font-size: 0.7em;
+        cursor: pointer;
+        transition: all 0.15s;
+        line-height: 1.4;
+      }
+      .ai-translation-delete-btn:hover {
+        background: #e74c3c;
+        border-color: #e74c3c;
+        color: white;
+      }
+      .ai-translation-block .ai-translation-content {
+        display: block;
+      }
+      .ai-loading-spinner {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        border: 2px solid #c8d6e5;
+        border-top-color: #6b8fd4;
+        border-radius: 50%;
+        animation: ai-spin 0.7s linear infinite;
+        vertical-align: middle;
+        margin-right: 6px;
+      }
+      @keyframes ai-spin {
+        to { transform: rotate(360deg); }
+      }
+      .ai-translation-loading .ai-translation-content {
+        color: #888;
+        font-style: italic;
+      }
+    `;
+    document.head.appendChild(translationStyleElement);
+  }
+
+  // HTML escape utility
+  function escapeHTML(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // Walk the DOM and find translatable paragraph-level elements
   // ========== Generic Content Extraction ==========
 
   function extractAllVisibleText() {
