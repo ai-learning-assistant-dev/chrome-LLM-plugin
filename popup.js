@@ -13,6 +13,7 @@ let isFirstChunkAfterStreamStart = false; // Flag for first chunk scrolling beha
 const chatContainer = document.getElementById('chatContainer');
 const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
+const stopBtn = document.getElementById('stopBtn');
 const statusEl = document.getElementById('status');
 const pageTitleEl = document.getElementById('pageTitle');
 const pageUrlEl = document.getElementById('pageUrl');
@@ -327,17 +328,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     console.log('[POPUP] STREAM_CHUNK received, done:', request.done, 'content length:', content.length);
 
     if (request.done) {
-      // Stream complete - content is empty, use streamingContent
+      // Stream complete (or stopped by user) - finalize the streaming message
       if (streamingMessageElement) {
         const currentFontSize = fontSizeSlider?.value || 12;
-        console.log('[POPUP] Stream done, streamingContent length:', streamingContent.length);
+        console.log('[POPUP] Stream done, streamingContent length:', streamingContent.length, 'stopped:', !!request.stopped);
 
         // Use streamingContent which has the final accumulated content
         // Render markdown
         if (typeof marked !== 'undefined' && streamingContent) {
           streamingMessageElement.innerHTML = marked.parse(streamingContent);
         } else {
-          streamingMessageElement.textContent = streamingContent;
+          streamingMessageElement.textContent = streamingContent || '(已停止生成)';
         }
         streamingMessageElement.style.fontSize = currentFontSize + 'px';
         streamingMessageElement.classList.remove('streaming');
@@ -345,14 +346,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         streamingMessageId = null;
         isFirstChunkAfterStreamStart = false;
 
-        // Add to conversation history
-        conversationHistory.push({ role: 'assistant', content: streamingContent });
+        // Add to conversation history (preserve partial content on stop)
+        if (streamingContent) {
+          conversationHistory.push({ role: 'assistant', content: streamingContent });
+        }
         saveConversation();
         streamingContent = ''; // Reset for next stream
-        statusEl.textContent = '就绪';
-        showLoading(false);
-        sendBtn.disabled = false;
-        userInput.focus();
+        restoreInputState();
+        statusEl.textContent = request.stopped ? '已停止' : '就绪';
       }
     } else {
       // background.js sends accumulated fullContent, use it directly for display
@@ -412,10 +413,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     isFirstChunkAfterStreamStart = false; // Reset flag
     conversationHistory.pop(); // Remove the user message since we failed
     saveConversation();
+    restoreInputState();
     statusEl.textContent = '就绪';
-    showLoading(false);
-    sendBtn.disabled = false;
-    userInput.focus();
     sendResponse({ received: true });
     return true;
   }
@@ -574,7 +573,8 @@ async function sendMessage() {
   await saveConversation();
 
   showLoading(true);
-  sendBtn.disabled = true;
+  sendBtn.style.display = 'none';
+  stopBtn.style.display = 'block';
   statusEl.textContent = '刷新页面内容...';
 
   try {
@@ -603,9 +603,7 @@ async function sendMessage() {
       senderTabId: currentTabId
     }).catch(error => {
       addMessage('error', `错误: ${error.message}`);
-      showLoading(false);
-      sendBtn.disabled = false;
-      userInput.focus();
+      restoreInputState();
       conversationHistory.pop();
       saveConversation();
       statusEl.textContent = '就绪';
@@ -619,6 +617,55 @@ async function sendMessage() {
   } finally {
     // Don't hide loading here - wait for stream to complete
   }
+}
+
+// Restore input state after streaming completes or is stopped
+function restoreInputState() {
+  showLoading(false);
+  sendBtn.style.display = 'block';
+  stopBtn.style.display = 'none';
+  userInput.disabled = false;
+  userInput.focus();
+}
+
+// Stop the current AI stream
+function stopStream() {
+  if (!streamingMessageId) return;
+
+  console.log('[POPUP] User requested stop stream for tab:', currentTabId);
+  statusEl.textContent = '正在停止...';
+
+  // Send stop message to background to abort the fetch
+  chrome.runtime.sendMessage({
+    type: 'STOP_STREAM',
+    senderTabId: currentTabId
+  }).catch(() => {});
+
+  // Finalize the current streaming message locally with accumulated content
+  if (streamingMessageElement) {
+    const currentFontSize = fontSizeSlider?.value || 12;
+
+    if (typeof marked !== 'undefined' && streamingContent) {
+      streamingMessageElement.innerHTML = marked.parse(streamingContent);
+    } else {
+      streamingMessageElement.textContent = streamingContent || '(已停止生成)';
+    }
+    streamingMessageElement.style.fontSize = currentFontSize + 'px';
+    streamingMessageElement.classList.remove('streaming');
+    streamingMessageElement = null;
+  }
+
+  // Add partial content to conversation history
+  if (streamingContent) {
+    conversationHistory.push({ role: 'assistant', content: streamingContent });
+    saveConversation();
+  }
+
+  streamingMessageId = null;
+  streamingContent = '';
+  isFirstChunkAfterStreamStart = false;
+  restoreInputState();
+  statusEl.textContent = '已停止';
 }
 
 // Add message to chat
@@ -651,10 +698,16 @@ function showLoading(show) {
 
 // Event listeners
 sendBtn.addEventListener('click', sendMessage);
+stopBtn.addEventListener('click', stopStream);
 userInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    sendMessage();
+    // If streaming, Enter stops it; otherwise sends
+    if (streamingMessageId) {
+      stopStream();
+    } else {
+      sendMessage();
+    }
   }
 });
 

@@ -43,19 +43,36 @@ const PROVIDERS = {
   }
 };
 
+// Track active stream AbortControllers keyed by senderTabId
+const activeStreams = {}; // senderTabId -> AbortController
+
 // Handle messages from popup / sidepanel
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'SEND_TO_AI') {
     // For streaming, we don't wait for response - chunks are sent via chrome.runtime.sendMessage
     sendToLLM(request.config, request.messages, request.senderTabId).catch(error => {
       console.error('[DEBUG] sendToLLM error:', error);
-      chrome.runtime.sendMessage({
-        type: 'STREAM_ERROR',
-        error: error.message,
-        senderTabId: request.senderTabId
-      }).catch(() => {});
+      // Only send error if it's not an abort
+      if (error.name !== 'AbortError') {
+        chrome.runtime.sendMessage({
+          type: 'STREAM_ERROR',
+          error: error.message,
+          senderTabId: request.senderTabId
+        }).catch(() => {});
+      }
     });
     sendResponse({ started: true });
+    return true;
+  }
+
+  if (request.type === 'STOP_STREAM') {
+    const controller = activeStreams[request.senderTabId];
+    if (controller) {
+      console.log('[DEBUG] Aborting stream for tab:', request.senderTabId);
+      controller.abort();
+      delete activeStreams[request.senderTabId];
+    }
+    sendResponse({ stopped: true });
     return true;
   }
 
@@ -228,18 +245,35 @@ async function sendToLLM(config, messages, senderTabId) {
     body.max_tokens = 1024;
   }
 
+  // Create AbortController and store it so user can stop the stream
+  const abortController = new AbortController();
+  activeStreams[senderTabId] = abortController;
+
   console.log('[DEBUG] Sending fetch request...');
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(body)
-  });
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(body),
+      signal: abortController.signal
+    });
+  } catch (fetchError) {
+    delete activeStreams[senderTabId];
+    if (fetchError.name === 'AbortError') {
+      console.log('[DEBUG] Fetch aborted by user for tab:', senderTabId);
+      // Popup handles the stop locally - just clean up silently
+      return { content: '', stopped: true };
+    }
+    throw fetchError;
+  }
   console.log('[DEBUG] Response status:', response.status);
 
   if (!response.ok) {
+    delete activeStreams[senderTabId];
     let errorMsg = `API error: ${response.status}`;
     try {
       const errorData = await response.json();
@@ -275,7 +309,18 @@ async function sendToLLM(config, messages, senderTabId) {
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      let readResult;
+      try {
+        readResult = await reader.read();
+      } catch (readError) {
+        // If the stream was aborted, reader.read() may throw
+        if (readError.name === 'AbortError' || abortController.signal.aborted) {
+          console.log('[DEBUG] Stream reading aborted for tab:', senderTabId);
+          break;
+        }
+        throw readError;
+      }
+      const { done, value } = readResult;
       if (done) break;
 
       const chunk = decoder.decode(value, { stream: true });
@@ -331,6 +376,9 @@ async function sendToLLM(config, messages, senderTabId) {
   } finally {
     reader.releaseLock();
   }
+
+  // Clean up the abort controller
+  delete activeStreams[senderTabId];
   console.log('[DEBUG] Stream complete, total content length:', fullContent.length);
 
   return {
