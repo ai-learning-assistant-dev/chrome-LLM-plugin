@@ -7,6 +7,7 @@
 | 浏览器 | 状态 | 说明 |
 |--------|------|------|
 | Chrome | ✅ 完全支持 | 推荐使用 |
+| Firefox | ✅ 完全支持 | 推荐使用 |
 | Edge (Chromium) | ✅ 完全支持 | 直接安装，无需修改 |
 | 其他 Chromium 浏览器 | ✅ 应该支持 | 如 Brave, Opera 等 |
 
@@ -52,6 +53,14 @@
 4. 选择 `ai-browser` 文件夹
 
 > ⚠️ Edge 基于 Chromium 内核，Chrome 扩展基本完全兼容，无需修改任何代码。
+
+### Firefox 浏览器
+
+1. 打开 Firefox，进入 `about:debugging#/runtime/this-firefox`
+2. 点击 **"临时载入附加组件…"**
+3. 选择 `ai-browser` 文件夹中的 `manifest.json` 文件
+
+> 💡 Firefox 支持 Manifest V3 扩展。`manifest.json` 中已包含 `browser_specific_settings` 配置，无需额外修改。如需永久安装，可通过 [Firefox Add-ons 开发者中心](https://addons.mozilla.org/developers/) 打包签名后分发。
 
 ## 使用方法
 
