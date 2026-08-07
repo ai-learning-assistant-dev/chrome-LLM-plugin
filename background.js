@@ -807,6 +807,7 @@ async function processStreamResponse(response, endpoint, config, messages, tools
       let roundContent = '';
       let roundToolCalls = {};
       let roundHasToolCalls = false;
+      const isLastRound = round === MAX_TOOL_ROUNDS - 1;
 
       try {
         const { apiKey, model, provider, customEndpoint } = config;
@@ -818,7 +819,8 @@ async function processStreamResponse(response, endpoint, config, messages, tools
           stream: true
         };
 
-        if (tools && tools.length > 0) {
+        // On the last round, DON'T send tools — forces AI to answer with text
+        if (tools && tools.length > 0 && !isLastRound) {
           followUpBody.tools = tools;
           followUpBody.tool_choice = 'auto';
         }
@@ -975,8 +977,41 @@ async function processStreamResponse(response, endpoint, config, messages, tools
 
         // No tool calls and no content - this round produced nothing useful
         if (!roundHasToolCalls && !roundContent) {
-          console.log('[DEBUG] Round produced no content and no tool calls, breaking');
-          fullContent += '\n\n*(搜索完成但未生成回复)*';
+          console.log('[DEBUG] Round produced no content and no tool calls');
+
+          // If we exhausted all rounds with no text — make one final non-tool call
+          if (isLastRound) {
+            console.log('[DEBUG] Exhausted all rounds, making final non-tool call to force AI response');
+            try {
+              const finalBody = {
+                model: config.model,
+                messages: followUpMessages,
+                stream: false
+              };
+              const ep = config.provider === 'custom' ? config.customEndpoint : PROVIDERS[config.provider].endpoint;
+              const finalResp = await fetch(ep, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${config.apiKey}`
+                },
+                body: JSON.stringify(finalBody),
+                signal: abortController.signal
+              });
+              if (finalResp.ok) {
+                const finalData = await finalResp.json();
+                const finalText = finalData.choices?.[0]?.message?.content || '';
+                if (finalText) {
+                  fullContent += '\n\n' + finalText;
+                  if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
+                }
+              }
+            } catch (finalError) {
+              if (finalError.name !== 'AbortError') {
+                console.error('[DEBUG] Final call error:', finalError);
+              }
+            }
+          }
           break;
         }
 

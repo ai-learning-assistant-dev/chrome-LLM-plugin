@@ -222,13 +222,15 @@ function buildSystemContent() {
 
     systemContent += `Please answer the user's questions based on this content. Be helpful and concise.
 
-You have access to a web_search tool. Use it when:
+You have access to a web_search tool. You may use it up to 3 times total per response. Use it when:
 - The user asks you to verify/fact-check information
 - The user needs real-time/current information not present in the page content
 - The user explicitly asks you to search for something
 - You are uncertain about a claim and need to verify it
 
-To search, use the web_search function with your search query. The search will return results from Bing including titles, URLs, and snippets. Use these results to provide accurate, up-to-date answers with source citations.`;
+To search, use the web_search function with your search query. The search will return results from Bing including titles, URLs, and snippets. Use these results to provide accurate, up-to-date answers with source citations.
+
+If you run out of searches, answer based on what you already found. If no results were found, state that honestly.`;
   }
   return systemContent;
 }
