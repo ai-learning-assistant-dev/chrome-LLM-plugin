@@ -45,6 +45,8 @@ const PROVIDERS = {
 
 // Track active stream AbortControllers keyed by senderTabId
 const activeStreams = {}; // senderTabId -> AbortController
+// Track active stream state so popup can reconnect after closing/reopening
+const streamSessions = {}; // senderTabId -> { messageId, content, done, stopped }
 
 // ===== Context Menu: Translate Paragraph =====
 // Create context menu item (idempotent - safe to call at startup)
@@ -151,7 +153,7 @@ Rules:
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'SEND_TO_AI') {
     // For streaming, we don't wait for response - chunks are sent via chrome.runtime.sendMessage
-    sendToLLM(request.config, request.messages, request.senderTabId).catch(error => {
+    sendToLLM(request.config, request.messages, request.tools, request.senderTabId).catch(error => {
       console.error('[DEBUG] sendToLLM error:', error);
       // Only send error if it's not an abort
       if (error.name !== 'AbortError') {
@@ -172,6 +174,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       console.log('[DEBUG] Aborting stream for tab:', request.senderTabId);
       controller.abort();
       delete activeStreams[request.senderTabId];
+      delete streamSessions[request.senderTabId];
     }
     sendResponse({ stopped: true });
     return true;
@@ -225,6 +228,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     });
     return true;
   }
+
+  if (request.type === 'WEB_SEARCH') {
+    performWebSearch(request.query, request.senderTabId)
+      .then(results => sendResponse({ results }))
+      .catch(error => sendResponse({ error: error.message, results: [] }));
+    return true;
+  }
+
+  if (request.type === 'GET_STREAM_STATE') {
+    const session = streamSessions[request.senderTabId];
+    if (session) {
+      sendResponse({
+        active: true,
+        messageId: session.messageId,
+        content: session.content,
+        done: session.done
+      });
+    } else {
+      sendResponse({ active: false });
+    }
+    return true;
+  }
 });
 
 // Track active content tab, ignoring extension pages (sidepanel, devtools, etc.)
@@ -253,6 +278,113 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     }
   }
 });
+
+// ===== Web Search =====
+
+// Perform a web search by opening a Bing search tab, extracting results, then closing it
+async function performWebSearch(query, senderTabId) {
+  const searchUrl = 'https://www.bing.com/search?q=' + encodeURIComponent(query);
+
+  console.log('[WebSearch] Searching Bing for:', query);
+
+  // Create a new tab with the Bing search
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: searchUrl, active: false });
+  } catch (e) {
+    throw new Error('无法创建搜索标签页: ' + e.message);
+  }
+
+  if (!tab || !tab.id) {
+    throw new Error('无法创建搜索标签页');
+  }
+
+  const tabId = tab.id;
+  console.log('[WebSearch] Created search tab:', tabId);
+
+  try {
+    // Wait for the tab to finish loading
+    let loaded = false;
+    const maxWaitMs = 15000; // 15 second timeout
+    const pollIntervalMs = 500;
+
+    const tabLoadPromise = new Promise((resolve, reject) => {
+      const checkComplete = () => {
+        if (loaded) return;
+        chrome.tabs.get(tabId, (t) => {
+          if (chrome.runtime.lastError || !t) {
+            reject(new Error('搜索标签页已关闭'));
+            return;
+          }
+          if (t.status === 'complete') {
+            loaded = true;
+            resolve();
+          }
+        });
+      };
+
+      // Listen for tab update events for faster detection
+      const updateListener = (updatedTabId, changeInfo) => {
+        if (updatedTabId === tabId && changeInfo.status === 'complete') {
+          loaded = true;
+          chrome.tabs.onUpdated.removeListener(updateListener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(updateListener);
+
+      // Poll as fallback
+      const pollInterval = setInterval(() => {
+        checkComplete();
+      }, pollIntervalMs);
+
+      // Timeout
+      const timeoutId = setTimeout(() => {
+        clearInterval(pollInterval);
+        chrome.tabs.onUpdated.removeListener(updateListener);
+        if (!loaded) {
+          reject(new Error('搜索页面加载超时'));
+        }
+      }, maxWaitMs);
+
+      // Cleanup on resolve
+      const origResolve = resolve;
+      resolve = () => {
+        clearInterval(pollInterval);
+        clearTimeout(timeoutId);
+        chrome.tabs.onUpdated.removeListener(updateListener);
+        origResolve();
+      };
+    });
+
+    await tabLoadPromise;
+    console.log('[WebSearch] Search tab loaded, extracting results...');
+
+    // Extract results from the Bing page
+    const extractResp = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_BING_RESULTS' });
+
+    const results = (extractResp && extractResp.results) ? extractResp.results : [];
+    console.log('[WebSearch] Extracted', results.length, 'results');
+
+    // Close the search tab
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (e) {
+      console.warn('[WebSearch] Could not close search tab:', e.message);
+    }
+
+    return results;
+
+  } catch (error) {
+    // Clean up: try to close the search tab
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (e) {
+      // Ignore close errors
+    }
+    throw error;
+  }
+}
 
 async function fetchModels(config) {
   const { provider, apiKey, customEndpoint, customModelsEndpoint } = config;
@@ -350,9 +482,9 @@ async function translateBatch(config, messages) {
   return { content: data.choices?.[0]?.message?.content || '' };
 }
 
-async function sendToLLM(config, messages, senderTabId) {
+async function sendToLLM(config, messages, tools, senderTabId) {
   const { provider, apiKey, model, customEndpoint } = config;
-  console.log('[DEBUG] sendToLLM called, provider:', provider, 'model:', model);
+  console.log('[DEBUG] sendToLLM called, provider:', provider, 'model:', model, 'hasTools:', !!tools);
 
   if (!apiKey) {
     console.error('[DEBUG] No API key');
@@ -384,6 +516,12 @@ async function sendToLLM(config, messages, senderTabId) {
     stream: true
   };
 
+  // Add tools if provided
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
+
   // Add max_tokens for providers that require it
   if (provider === 'anthropic') {
     body.max_tokens = 1024;
@@ -407,9 +545,9 @@ async function sendToLLM(config, messages, senderTabId) {
     });
   } catch (fetchError) {
     delete activeStreams[senderTabId];
+    delete streamSessions[senderTabId];
     if (fetchError.name === 'AbortError') {
       console.log('[DEBUG] Fetch aborted by user for tab:', senderTabId);
-      // Popup handles the stop locally - just clean up silently
       return { content: '', stopped: true };
     }
     throw fetchError;
@@ -418,13 +556,13 @@ async function sendToLLM(config, messages, senderTabId) {
 
   if (!response.ok) {
     delete activeStreams[senderTabId];
+    delete streamSessions[senderTabId];
     let errorMsg = `API error: ${response.status}`;
     try {
       const errorData = await response.json();
       errorMsg = errorData.error?.message || errorData.message || errorMsg;
     } catch (e) {}
     console.error('[DEBUG] Response not ok:', errorMsg);
-    // Send error to popup
     chrome.runtime.sendMessage({
       type: 'STREAM_ERROR',
       error: errorMsg,
@@ -433,16 +571,30 @@ async function sendToLLM(config, messages, senderTabId) {
     return { error: errorMsg };
   }
 
-  // Handle streaming response
-  console.log('[DEBUG] Starting to read stream...');
+  // Process the streaming response - this may involve tool calls
+  const result = await processStreamResponse(response, endpoint, config, messages, tools, abortController, senderTabId);
+
+  // Clean up the abort controller
+  delete activeStreams[senderTabId];
+
+  return result;
+}
+
+// Process a streaming SSE response, handling tool calls if present
+async function processStreamResponse(response, endpoint, config, messages, tools, abortController, senderTabId) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let fullContent = '';
   let messageId = Date.now().toString();
 
-  // Send initial "start" event
+  // Track tool calls in streaming response
+  let toolCalls = {}; // index -> { id, name, arguments }
+  let hasToolCalls = false;
+
+  // Send initial "start" event and initialize stream session
   console.log('[DEBUG] Sending STREAM_START, senderTabId:', senderTabId);
+  streamSessions[senderTabId] = { messageId, content: '', done: false, stopped: false };
   setTimeout(() => {
     chrome.runtime.sendMessage({
       type: 'STREAM_START',
@@ -457,7 +609,6 @@ async function sendToLLM(config, messages, senderTabId) {
       try {
         readResult = await reader.read();
       } catch (readError) {
-        // If the stream was aborted, reader.read() may throw
         if (readError.name === 'AbortError' || abortController.signal.aborted) {
           console.log('[DEBUG] Stream reading aborted for tab:', senderTabId);
           break;
@@ -468,7 +619,6 @@ async function sendToLLM(config, messages, senderTabId) {
       if (done) break;
 
       const chunk = decoder.decode(value, { stream: true });
-      console.log('[DEBUG] Received chunk, length:', chunk.length, 'data:', chunk.substring(0, 100));
       buffer += chunk;
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
@@ -478,39 +628,67 @@ async function sendToLLM(config, messages, senderTabId) {
           const data = line.slice(6).trim();
           if (data === '[DONE]') {
             console.log('[DEBUG] Received [DONE]');
-            // Send final chunk
-            setTimeout(() => {
-              chrome.runtime.sendMessage({
-                type: 'STREAM_CHUNK',
-                messageId,
-                content: '',
-                done: true,
-                senderTabId
-              }).catch(e => console.error('[DEBUG] Failed to send final STREAM_CHUNK:', e));
-            }, 0);
+            if (!hasToolCalls) {
+              // Normal completion: send final chunk and return early (skip tool-call loop below)
+              streamSessions[senderTabId].done = true;
+              setTimeout(() => {
+                chrome.runtime.sendMessage({
+                  type: 'STREAM_CHUNK',
+                  messageId,
+                  content: fullContent,
+                  done: true,
+                  senderTabId
+                }).catch(e => console.error('[DEBUG] Failed to send final STREAM_CHUNK:', e));
+              }, 0);
+
+              console.log('[DEBUG] Stream complete (no tool calls), total content length:', fullContent.length);
+              setTimeout(() => { delete streamSessions[senderTabId]; }, 30000);
+              return {
+                content: fullContent,
+                id: messageId
+              };
+            }
             continue;
           }
           try {
             const parsed = JSON.parse(data);
-            const content = parsed.choices?.[0]?.delta?.content || '';
-            if (content) {
+            const choice = parsed.choices?.[0];
+            const delta = choice?.delta || {};
+
+            // Check for tool calls in delta
+            if (delta.tool_calls && delta.tool_calls.length > 0) {
+              hasToolCalls = true;
+              for (const tc of delta.tool_calls) {
+                const idx = tc.index !== undefined ? tc.index : 0;
+                if (!toolCalls[idx]) {
+                  toolCalls[idx] = { id: tc.id || '', name: '', arguments: '' };
+                }
+                if (tc.id) toolCalls[idx].id = tc.id;
+                if (tc.function?.name) toolCalls[idx].name += tc.function.name;
+                if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments;
+              }
+            }
+
+            // Also track content in case of mixed response
+            const content = delta.content || '';
+            if (content && !hasToolCalls) {
               fullContent += content;
-              console.log('[DEBUG] Sending chunk, fullContent length:', fullContent.length);
-              // Send each chunk with setTimeout to allow message delivery during stream
+              // Update stream session for reconnection
+              if (streamSessions[senderTabId]) {
+                streamSessions[senderTabId].content = fullContent;
+              }
+              // Send streaming chunk
               const chunkContent = fullContent;
-              const chunkMessageId = messageId;
-              const chunkSenderTabId = senderTabId;
               setTimeout(() => {
                 chrome.runtime.sendMessage({
                   type: 'STREAM_CHUNK',
-                  messageId: chunkMessageId,
+                  messageId,
                   content: chunkContent,
                   done: false,
-                  senderTabId: chunkSenderTabId
+                  senderTabId
                 }).catch(e => console.error('[DEBUG] Failed to send STREAM_CHUNK:', e));
               }, 0);
             }
-            // Note: keep using original messageId (timestamp), don't use API's id
           } catch (e) {
             // Skip invalid JSON
           }
@@ -521,9 +699,320 @@ async function sendToLLM(config, messages, senderTabId) {
     reader.releaseLock();
   }
 
-  // Clean up the abort controller
-  delete activeStreams[senderTabId];
+  // Handle tool calls if detected
+  if (hasToolCalls && Object.keys(toolCalls).length > 0) {
+    console.log('[DEBUG] Detected tool calls:', Object.keys(toolCalls).length);
+
+    // Notify popup that we're searching
+    fullContent = fullContent + '\n\n🔍 *正在搜索网页...*';
+    if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
+    chrome.runtime.sendMessage({
+      type: 'STREAM_CHUNK',
+      messageId,
+      content: fullContent,
+      done: false,
+      senderTabId
+    }).catch(e => console.error('[DEBUG] Failed to send search indicator:', e));
+
+    // Execute each tool call
+    const toolResults = [];
+    const sortedCalls = Object.keys(toolCalls).sort().map(k => toolCalls[k]);
+
+    for (const toolCall of sortedCalls) {
+      if (toolCall.name === 'web_search') {
+        try {
+          const args = JSON.parse(toolCall.arguments || '{}');
+          const query = args.query || '';
+          console.log('[DEBUG] Executing web_search for:', query);
+
+          // Send search notification
+          fullContent = fullContent + '\n\n🔍 *正在搜索: ' + query + '...*';
+          if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
+          chrome.runtime.sendMessage({
+            type: 'STREAM_CHUNK',
+            messageId,
+            content: fullContent,
+            done: false,
+            senderTabId
+          }).catch(() => {});
+
+          const searchResults = await performWebSearch(query, senderTabId);
+
+          // Format results for the AI
+          const resultsText = searchResults.length > 0
+            ? JSON.stringify(searchResults, null, 2)
+            : '没有找到相关结果';
+
+          toolResults.push({
+            tool_call_id: toolCall.id,
+            role: 'tool',
+            content: resultsText
+          });
+
+          fullContent += '\n\n🔍 **搜索结果: ' + query + '**\n';
+          if (searchResults.length > 0) {
+            searchResults.forEach((r, i) => {
+              fullContent += (i + 1) + '. [' + r.title + '](' + r.url + ')\n';
+            });
+          } else {
+            fullContent += '没有找到结果\n';
+          }
+
+          console.log('[DEBUG] Web search completed, got', searchResults.length, 'results');
+        } catch (e) {
+          console.error('[DEBUG] Web search error:', e);
+          toolResults.push({
+            tool_call_id: toolCall.id,
+            role: 'tool',
+            content: '搜索出错: ' + e.message
+          });
+        }
+      } else {
+        // Unknown tool
+        toolResults.push({
+          tool_call_id: toolCall.id,
+          role: 'tool',
+          content: '未知工具: ' + toolCall.name
+        });
+      }
+    }
+
+    // Build the assistant's tool call message
+    const assistantToolMsg = {
+      role: 'assistant',
+      content: null,
+      tool_calls: sortedCalls.map(tc => ({
+        id: tc.id,
+        type: 'function',
+        function: {
+          name: tc.name,
+          arguments: tc.arguments
+        }
+      }))
+    };
+
+    // Start with messages extended by tool call + results
+    let followUpMessages = [
+      ...messages,
+      assistantToolMsg,
+      ...toolResults
+    ];
+
+    // Multi-round tool calling: loop until AI returns text content (no more tool_calls)
+    const MAX_TOOL_ROUNDS = 3;
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      console.log('[DEBUG] Tool call round', round + 1, 'of max', MAX_TOOL_ROUNDS);
+
+      // Make a streaming follow-up call
+      let roundContent = '';
+      let roundToolCalls = {};
+      let roundHasToolCalls = false;
+
+      try {
+        const { apiKey, model, provider, customEndpoint } = config;
+        let ep = provider === 'custom' ? customEndpoint : PROVIDERS[provider].endpoint;
+
+        const followUpBody = {
+          model: model,
+          messages: followUpMessages,
+          stream: true
+        };
+
+        if (tools && tools.length > 0) {
+          followUpBody.tools = tools;
+          followUpBody.tool_choice = 'auto';
+        }
+
+        const roundResponse = await fetch(ep, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify(followUpBody),
+          signal: abortController.signal
+        });
+
+        if (!roundResponse.ok) {
+          console.error('[DEBUG] Follow-up API call failed:', roundResponse.status);
+          fullContent += '\n\n*(搜索完成但生成回复失败)*';
+          break;
+        }
+
+        // Stream the follow-up response to extract content and detect tool calls
+        const roundReader = roundResponse.body.getReader();
+        const roundDecoder = new TextDecoder();
+        let roundBuffer = '';
+
+        try {
+          while (true) {
+            const { done, value } = await roundReader.read();
+            if (done) break;
+
+            const chunk = roundDecoder.decode(value, { stream: true });
+            roundBuffer += chunk;
+            const lines = roundBuffer.split('\n');
+            roundBuffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6).trim();
+                if (data === '[DONE]') continue;
+                try {
+                  const parsed = JSON.parse(data);
+                  const delta = parsed.choices?.[0]?.delta || {};
+
+                  // Check for tool calls
+                  if (delta.tool_calls && delta.tool_calls.length > 0) {
+                    roundHasToolCalls = true;
+                    for (const tc of delta.tool_calls) {
+                      const idx = tc.index !== undefined ? tc.index : 0;
+                      if (!roundToolCalls[idx]) {
+                        roundToolCalls[idx] = { id: tc.id || '', name: '', arguments: '' };
+                      }
+                      if (tc.id) roundToolCalls[idx].id = tc.id;
+                      if (tc.function?.name) roundToolCalls[idx].name += tc.function.name;
+                      if (tc.function?.arguments) roundToolCalls[idx].arguments += tc.function.arguments;
+                    }
+                  }
+
+                  // Accumulate text content
+                  const textContent = delta.content || '';
+                  if (textContent && !roundHasToolCalls) {
+                    roundContent += textContent;
+                    fullContent += textContent;
+                    if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
+
+                    // Send streaming update to popup
+                    chrome.runtime.sendMessage({
+                      type: 'STREAM_CHUNK',
+                      messageId,
+                      content: fullContent,
+                      done: false,
+                      senderTabId
+                    }).catch(() => {});
+                  }
+                } catch (e) { /* skip invalid JSON */ }
+              }
+            }
+          }
+        } finally {
+          roundReader.releaseLock();
+        }
+
+        // If the AI returned text content and no more tool calls, we're done
+        if (!roundHasToolCalls && roundContent) {
+          console.log('[DEBUG] AI returned final text content, done after round', round + 1);
+          break;
+        }
+
+        // If the AI wants more tool calls, execute them
+        if (roundHasToolCalls && Object.keys(roundToolCalls).length > 0) {
+          console.log('[DEBUG] Round', round + 1, 'detected more tool calls:', Object.keys(roundToolCalls).length);
+
+          const assistantMsg = {
+            role: 'assistant',
+            content: roundContent || null,
+            tool_calls: Object.keys(roundToolCalls).sort().map(k => {
+              const tc = roundToolCalls[k];
+              return {
+                id: tc.id,
+                type: 'function',
+                function: { name: tc.name, arguments: tc.arguments }
+              };
+            })
+          };
+
+          followUpMessages.push(assistantMsg);
+
+          // Execute each new tool call
+          const sortedRoundCalls = Object.keys(roundToolCalls).sort().map(k => roundToolCalls[k]);
+          for (const tc of sortedRoundCalls) {
+            if (tc.name === 'web_search') {
+              try {
+                const args = JSON.parse(tc.arguments || '{}');
+                const query = args.query || '';
+
+                fullContent += '\n\n🔍 *正在搜索: ' + query + '...*';
+                if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
+                chrome.runtime.sendMessage({
+                  type: 'STREAM_CHUNK', messageId, content: fullContent, done: false, senderTabId
+                }).catch(() => {});
+
+                const searchResults = await performWebSearch(query, senderTabId);
+
+                const resultsText = searchResults.length > 0
+                  ? JSON.stringify(searchResults, null, 2)
+                  : '没有找到相关结果';
+
+                followUpMessages.push({
+                  tool_call_id: tc.id,
+                  role: 'tool',
+                  content: resultsText
+                });
+
+                fullContent += '\n\n🔍 **搜索结果: ' + query + '**\n';
+                if (searchResults.length > 0) {
+                  searchResults.forEach((r, i) => {
+                    fullContent += (i + 1) + '. [' + r.title + '](' + r.url + ')\n';
+                  });
+                } else {
+                  fullContent += '没有找到结果\n';
+                }
+                if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
+              } catch (e) {
+                followUpMessages.push({
+                  tool_call_id: tc.id,
+                  role: 'tool',
+                  content: '搜索出错: ' + e.message
+                });
+              }
+            }
+          }
+          // Continue loop for next round
+          continue;
+        }
+
+        // No tool calls and no content - this round produced nothing useful
+        if (!roundHasToolCalls && !roundContent) {
+          console.log('[DEBUG] Round produced no content and no tool calls, breaking');
+          fullContent += '\n\n*(搜索完成但未生成回复)*';
+          break;
+        }
+
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          console.log('[DEBUG] Follow-up call aborted');
+          return { content: fullContent, stopped: true };
+        }
+        console.error('[DEBUG] Follow-up API call error:', e);
+        fullContent += '\n\n*(搜索完成但生成回复时出错: ' + e.message + ')*';
+        break;
+      }
+    }
+
+    // Send final done chunk
+    setTimeout(() => {
+      if (streamSessions[senderTabId]) {
+        streamSessions[senderTabId].done = true;
+        streamSessions[senderTabId].content = fullContent;
+      }
+      chrome.runtime.sendMessage({
+        type: 'STREAM_CHUNK',
+        messageId,
+        content: fullContent,
+        done: true,
+        senderTabId
+      }).catch(e => console.error('[DEBUG] Failed to send final STREAM_CHUNK:', e));
+    }, 100);
+  }
+
   console.log('[DEBUG] Stream complete, total content length:', fullContent.length);
+
+  // Clean up stream session after a delay (allow popup to reconnect briefly)
+  setTimeout(() => {
+    delete streamSessions[senderTabId];
+  }, 30000);
 
   return {
     content: fullContent,

@@ -14,7 +14,8 @@
   "permissions": [
     "storage",
     "sidePanel",
-    "contextMenus"
+    "contextMenus",
+    "tabs"
   ],
   "host_permissions": [
     "https://api.anthropic.com/*",

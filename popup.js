@@ -220,7 +220,15 @@ function buildSystemContent() {
       systemContent += `=== Comments ===\n${commentsStr}\n\n`;
     }
 
-    systemContent += `Please answer the user's questions based on this content. Be helpful and concise.`;
+    systemContent += `Please answer the user's questions based on this content. Be helpful and concise.
+
+You have access to a web_search tool. Use it when:
+- The user asks you to verify/fact-check information
+- The user needs real-time/current information not present in the page content
+- The user explicitly asks you to search for something
+- You are uncertain about a claim and need to verify it
+
+To search, use the web_search function with your search query. The search will return results from Bing including titles, URLs, and snippets. Use these results to provide accurate, up-to-date answers with source citations.`;
   }
   return systemContent;
 }
@@ -280,6 +288,61 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }, 2000);
     }
+
+    // Reconnect to any active stream for this tab (popup was closed/reopened mid-stream)
+    const streamState = await chrome.runtime.sendMessage({
+      type: 'GET_STREAM_STATE',
+      senderTabId: currentTabId
+    }).catch(() => ({ active: false }));
+
+    if (streamState && streamState.active) {
+      console.log('[POPUP] Reconnecting to active stream, messageId:', streamState.messageId, 'content length:', (streamState.content || '').length);
+      streamingMessageId = streamState.messageId;
+      streamingContent = streamState.content || '';
+      isFirstChunkAfterStreamStart = false;
+
+      if (streamState.done) {
+        // Stream already completed - finalize immediately
+        const doneContent = streamState.content || '';
+        const msg = document.createElement('div');
+        msg.className = 'message assistant';
+        const currentFontSize = fontSizeSlider?.value || 12;
+        msg.style.fontSize = currentFontSize + 'px';
+        if (typeof marked !== 'undefined' && doneContent) {
+          msg.innerHTML = marked.parse(doneContent);
+        } else {
+          msg.textContent = doneContent || '(空响应)';
+        }
+        chatContainer.appendChild(msg);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        if (doneContent) {
+          conversationHistory.push({ role: 'assistant', content: doneContent });
+        }
+        saveConversation();
+        streamingMessageId = null;
+        streamingContent = '';
+        isFirstChunkAfterStreamStart = false;
+      } else {
+        // Stream still in progress - show live content with cursor and loading UI
+        streamingMessageElement = document.createElement('div');
+        streamingMessageElement.className = 'message assistant streaming';
+        const currentFontSize = fontSizeSlider?.value || 12;
+        streamingMessageElement.style.fontSize = currentFontSize + 'px';
+        if (typeof marked !== 'undefined' && streamingContent) {
+          streamingMessageElement.innerHTML = marked.parse(streamingContent) + '<span class="streaming-cursor">▊</span>';
+        } else if (streamingContent) {
+          streamingMessageElement.textContent = streamingContent;
+        } else {
+          streamingMessageElement.innerHTML = '<span class="streaming-cursor">▊</span>';
+        }
+        chatContainer.appendChild(streamingMessageElement);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        showLoading(true);
+        sendBtn.style.display = 'none';
+        stopBtn.style.display = 'block';
+        statusEl.textContent = '接收中...';
+      }
+    }
   }
 });
 
@@ -297,6 +360,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     console.log('[POPUP] STREAM_START received, messageId:', request.messageId);
+
+    // If we already have a streaming message for this messageId (reconnect happened), skip
+    if (streamingMessageId === request.messageId && streamingMessageElement) {
+      console.log('[POPUP] STREAM_START skipped - already reconnected to this stream');
+      sendResponse({ received: true });
+      return true;
+    }
+
     streamingMessageId = request.messageId;
     streamingContent = ''; // Reset accumulated content
     isFirstChunkAfterStreamStart = true; // Reset flag for first chunk
@@ -314,11 +385,63 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === 'STREAM_CHUNK') {
-    // Ignore if not for this tab or different message
+    // Ignore if not for this tab
     if (request.senderTabId !== currentTabId) {
       console.log('[POPUP] STREAM_CHUNK ignored - tab mismatch');
       return;
     }
+
+    // Auto-reconnect: if we get a chunk but don't have a streaming message,
+    // it means the popup was reopened mid-stream and hasn't reconnected yet.
+    if (!streamingMessageId || !streamingMessageElement) {
+      console.log('[POPUP] Auto-reconnecting to stream, messageId:', request.messageId);
+      streamingMessageId = request.messageId;
+      streamingContent = request.content || '';
+      isFirstChunkAfterStreamStart = false;
+
+      streamingMessageElement = document.createElement('div');
+      streamingMessageElement.className = 'message assistant streaming';
+      const currentFontSize = fontSizeSlider?.value || 12;
+      streamingMessageElement.style.fontSize = currentFontSize + 'px';
+
+      if (request.done) {
+        // Already done - finalize directly
+        if (typeof marked !== 'undefined' && request.content) {
+          streamingMessageElement.innerHTML = marked.parse(request.content);
+        } else {
+          streamingMessageElement.textContent = request.content || '(空响应)';
+        }
+        streamingMessageElement.classList.remove('streaming');
+        streamingMessageElement = null;
+        if (request.content) {
+          conversationHistory.push({ role: 'assistant', content: request.content });
+        }
+        saveConversation();
+        streamingMessageId = null;
+        streamingContent = '';
+        isFirstChunkAfterStreamStart = false;
+        restoreInputState();
+        sendResponse({ received: true });
+        return true;
+      }
+
+      // Show partial content with cursor
+      if (typeof marked !== 'undefined' && request.content) {
+        streamingMessageElement.innerHTML = marked.parse(request.content) + '<span class="streaming-cursor">▊</span>';
+      } else if (request.content) {
+        streamingMessageElement.textContent = request.content;
+      } else {
+        streamingMessageElement.innerHTML = '<span class="streaming-cursor">▊</span>';
+      }
+      chatContainer.appendChild(streamingMessageElement);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+      showLoading(true);
+      sendBtn.style.display = 'none';
+      stopBtn.style.display = 'block';
+      sendResponse({ received: true });
+      return true;
+    }
+
     if (request.messageId !== streamingMessageId) {
       console.log('[POPUP] STREAM_CHUNK ignored - messageId mismatch', request.messageId, 'vs', streamingMessageId);
       return;
@@ -594,12 +717,32 @@ async function sendMessage() {
     const actualModel = model || (provider === 'custom' ? 'custom-model' : '');
     const config = { provider, apiKey, model: actualModel, customEndpoint };
 
+    // Include tool definitions for web_search
+    const tools = [{
+      type: 'function',
+      function: {
+        name: 'web_search',
+        description: 'Search the web using Bing to get real-time information, verify facts, or find current data. Use this when the user asks for information that may not be in the page content, needs verification, or requires up-to-date data.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'The search query to send to Bing. Be specific and use keywords for best results.'
+            }
+          },
+          required: ['query']
+        }
+      }
+    }];
+
     // Send request - for streaming, we don't wait for response here
     // The streaming chunks will come back via chrome.runtime.onMessage
     chrome.runtime.sendMessage({
       type: 'SEND_TO_AI',
       config,
       messages,
+      tools,
       senderTabId: currentTabId
     }).catch(error => {
       addMessage('error', `错误: ${error.message}`);

@@ -31,8 +31,99 @@
       return true;
     }
 
+    if (request.type === 'EXTRACT_BING_RESULTS') {
+      const results = extractBingSearchResults();
+      sendResponse({ results });
+      return true;
+    }
+
     return true;
   });
+
+  // ========== Bing Search Result Extraction ==========
+
+  function extractBingSearchResults() {
+    const results = [];
+
+    // Bing search result selectors (Bing's structure as of 2024-2026)
+    // Main search results are in <li class="b_algo"> elements
+    const algoItems = document.querySelectorAll('li.b_algo');
+
+    algoItems.forEach((item, index) => {
+      // Title and link are in the h2 > a element
+      const titleEl = item.querySelector('h2 a, h2');
+      const title = titleEl ? titleEl.textContent.trim() : '';
+      const url = titleEl && titleEl.href ? titleEl.href : '';
+
+      // Description/snippet is in various possible elements
+      let snippet = '';
+      const snippetEl = item.querySelector('.b_caption p, .b_lineclamp2, .b_algoSlug, p');
+      if (snippetEl) {
+        snippet = snippetEl.textContent.trim();
+      }
+
+      // If no snippet found, try getting any text content excluding the title
+      if (!snippet) {
+        const clone = item.cloneNode(true);
+        const h2 = clone.querySelector('h2');
+        if (h2) h2.remove();
+        snippet = clone.textContent.trim().substring(0, 500);
+      }
+
+      if (title && url) {
+        results.push({
+          index: index + 1,
+          title: title,
+          url: url,
+          snippet: snippet
+        });
+      }
+    });
+
+    // If no b_algo items found, try alternative selectors
+    if (results.length === 0) {
+      // Try the newer Bing result structure
+      const resultElements = document.querySelectorAll('#b_results .b_algo, #b_results > li');
+      resultElements.forEach((item, index) => {
+        const titleEl = item.querySelector('h2 a, a[href] h2');
+        if (!titleEl) return;
+        const title = titleEl.textContent.trim();
+        const url = titleEl.href || titleEl.closest('a')?.href || '';
+        const snippetEl = item.querySelector('.b_caption p, p');
+        const snippet = snippetEl ? snippetEl.textContent.trim() : '';
+
+        if (title) {
+          results.push({
+            index: index + 1,
+            title: title,
+            url: url,
+            snippet: snippet
+          });
+        }
+      });
+    }
+
+    // Also check for news/answer cards at the top
+    const answerCards = document.querySelectorAll('.b_ans, .b_entity, .b_rich');
+    answerCards.forEach((card, index) => {
+      const titleEl = card.querySelector('h2, h3, .b_entityTitle');
+      const textEl = card.querySelector('.b_factrow, p, .b_paractl');
+      const title = titleEl ? titleEl.textContent.trim() : '';
+      const text = textEl ? textEl.textContent.trim().substring(0, 500) : '';
+
+      if (title || text) {
+        results.unshift({
+          index: 0,
+          title: title || 'Featured Result',
+          url: window.location.href,
+          snippet: text || title
+        });
+      }
+    });
+
+    console.log('[AI Browser] Extracted', results.length, 'Bing search results');
+    return results.slice(0, 10); // Limit to top 10 results
+  }
 
   // ========== Deep Shadow DOM Text Extraction ==========
 
