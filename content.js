@@ -37,6 +37,24 @@
       return true;
     }
 
+    if (request.type === 'EXTRACT_GOOGLE_RESULTS') {
+      const results = extractGoogleSearchResults();
+      sendResponse({ results });
+      return true;
+    }
+
+    if (request.type === 'EXTRACT_BAIDU_RESULTS') {
+      const results = extractBaiduSearchResults();
+      sendResponse({ results });
+      return true;
+    }
+
+    if (request.type === 'EXTRACT_WIKIPEDIA_RESULTS') {
+      const results = extractWikipediaSearchResults();
+      sendResponse({ results });
+      return true;
+    }
+
     return true;
   });
 
@@ -123,6 +141,280 @@
 
     console.log('[AI Browser] Extracted', results.length, 'Bing search results');
     return results.slice(0, 10); // Limit to top 10 results
+  }
+
+  // ========== Google Search Result Extraction ==========
+
+  function extractGoogleSearchResults() {
+    const results = [];
+
+    // Google's SERP DOM structure (2024-2026)
+    // Main organic results are in various div wrappers
+    // Try multiple selectors to handle A/B testing variants
+
+    // Primary selector: div.g (traditional Google result wrapper)
+    let resultElements = document.querySelectorAll('div.g');
+
+    // If no results, try alternative selectors
+    if (resultElements.length === 0) {
+      resultElements = document.querySelectorAll('div#search .g, div.MjjYud, div[data-sokoban-container]');
+    }
+
+    // If still no results, try the newer structure
+    if (resultElements.length === 0) {
+      resultElements = document.querySelectorAll('#search div[data-hveid]');
+    }
+
+    // Check for CAPTCHA / bot detection
+    const captchaEl = document.querySelector('form#captcha-form, div#recaptcha, div.g-recaptcha');
+    if (captchaEl) {
+      console.log('[AI Browser] Google CAPTCHA detected');
+      return [{ index: 0, title: 'Google CAPTCHA Detected', url: '', snippet: 'Google requires CAPTCHA verification. Please try Bing or another search engine instead.' }];
+    }
+
+    resultElements.forEach((item, index) => {
+      // Skip items that are too small or likely non-result elements
+      const rect = item.getBoundingClientRect();
+      if (rect.height < 20) return;
+
+      // Try to find the title link (h3 element)
+      const titleEl = item.querySelector('h3');
+      const linkEl = titleEl ? titleEl.closest('a') : item.querySelector('a[href]');
+      const title = titleEl ? titleEl.textContent.trim() : '';
+      let url = '';
+
+      if (linkEl && linkEl.href) {
+        // Google wraps URLs in /url?q=... redirects
+        const href = linkEl.href;
+        if (href.includes('/url?') && href.includes('&q=')) {
+          // Extract the actual URL from the redirect
+          const qMatch = href.match(/[?&]q=([^&]+)/);
+          if (qMatch) {
+            url = decodeURIComponent(qMatch[1]);
+          }
+        } else if (href.includes('/url?q=')) {
+          const qMatch = href.match(/\/url\?q=([^&]+)/);
+          if (qMatch) {
+            url = decodeURIComponent(qMatch[1]);
+          }
+        }
+        // Fallback: use the raw href if it doesn't look like a redirect
+        if (!url && !href.startsWith('/url?')) {
+          url = href;
+        }
+      }
+
+      // Find the snippet
+      let snippet = '';
+      const snippetEls = item.querySelectorAll('div.VwiC3b, span.aCOpRe, div[data-sncf], span.st, div.IsZvec');
+      for (const el of snippetEls) {
+        const t = el.textContent.trim();
+        if (t.length > 10) {
+          snippet = t;
+          break;
+        }
+      }
+      // Fallback snippet extraction
+      if (!snippet) {
+        const allText = item.textContent.trim();
+        if (title && allText.startsWith(title)) {
+          snippet = allText.substring(title.length).trim().substring(0, 500);
+        }
+      }
+
+      if (title) {
+        results.push({
+          index: results.length + 1,
+          title: title,
+          url: url || ('https://www.google.com/search?q=' + encodeURIComponent(title)),
+          snippet: snippet
+        });
+      }
+    });
+
+    // Check for featured snippets / knowledge panels / answer boxes
+    const featuredSelectors = [
+      'div.ifM9O',           // Featured snippet
+      'div[data-attrid]',    // Knowledge panel
+      'div.kp-wholepage',    // Knowledge graph
+      'div.hsjuVe',          // Answer box
+      'div.g.kno-kp',        // Knowledge panel card
+      'div.g.kno-fb-ctx'     // Knowledge panel context
+    ];
+    for (const sel of featuredSelectors) {
+      const featured = document.querySelector(sel);
+      if (featured) {
+        const titleEl = featured.querySelector('h2, h3, [data-attrid="title"]');
+        const textEl = featured.querySelector('span, div[data-attrid]');
+        const title = titleEl ? titleEl.textContent.trim().substring(0, 200) : 'Featured Result';
+        const text = textEl ? textEl.textContent.trim().substring(0, 500) : '';
+        if (text && !results.some(r => r.snippet === text)) {
+          results.unshift({
+            index: 0,
+            title: title || 'Featured Result',
+            url: window.location.href,
+            snippet: text || title
+          });
+        }
+        break;
+      }
+    }
+
+    console.log('[AI Browser] Extracted', results.length, 'Google search results');
+    return results.slice(0, 10);
+  }
+
+  // ========== Baidu Search Result Extraction ==========
+
+  function extractBaiduSearchResults() {
+    const results = [];
+
+    // Baidu's SERP DOM structure (2024-2026)
+    // Primary: div.result.c-container
+    // Alternative: #content_left .result
+
+    let resultElements = document.querySelectorAll('div.result.c-container');
+
+    if (resultElements.length === 0) {
+      resultElements = document.querySelectorAll('#content_left .result, #content_left > div.result');
+    }
+
+    if (resultElements.length === 0) {
+      resultElements = document.querySelectorAll('.c-container');
+    }
+
+    resultElements.forEach((item, index) => {
+      // Filter out ad results (Baidu ads use specific attributes)
+      if (item.hasAttribute('ec-wise') || item.hasAttribute('data-ec-wise')) return;
+      if (item.querySelector('[ec-wise]')) return;
+      // Check for ad markers in the class
+      if (item.className && (item.className.includes('ec_') || item.className.includes('fw_bg'))) return;
+
+      // Title: h3 > a, or .t > a
+      const titleEl = item.querySelector('h3 a, h3, .t a');
+      const title = titleEl ? titleEl.textContent.trim() : '';
+
+      // URL: from the link or display URL element
+      let url = '';
+      const linkEl = item.querySelector('h3 a[href], .t a[href]');
+      if (linkEl && linkEl.href && !linkEl.href.startsWith('javascript:')) {
+        url = linkEl.href;
+      }
+      // Fallback: Baidu sometimes shows the URL in a separate element
+      if (!url) {
+        const urlEl = item.querySelector('.c-showurl, .c-showurl span, .f13');
+        if (urlEl) {
+          const rawUrl = urlEl.textContent.trim();
+          if (rawUrl) {
+            url = rawUrl.startsWith('http') ? rawUrl : 'https://' + rawUrl;
+          }
+        }
+      }
+
+      // Snippet: .c-abstract, .c-span-last, or general text
+      let snippet = '';
+      const snippetEls = item.querySelectorAll('.c-abstract, .c-span-last, .content-right_8Zs40, .c-row');
+      for (const el of snippetEls) {
+        const t = el.textContent.trim();
+        if (t.length > 5) {
+          snippet = t;
+          break;
+        }
+      }
+
+      // Fallback: try getting text from the result excluding the title area
+      if (!snippet) {
+        const clone = item.cloneNode(true);
+        const h3 = clone.querySelector('h3');
+        if (h3) h3.remove();
+        const tDiv = clone.querySelector('.t');
+        if (tDiv) tDiv.remove();
+        snippet = clone.textContent.trim().substring(0, 500);
+      }
+
+      if (title) {
+        results.push({
+          index: results.length + 1,
+          title: title,
+          url: url || ('https://www.baidu.com/s?wd=' + encodeURIComponent(title)),
+          snippet: snippet
+        });
+      }
+    });
+
+    console.log('[AI Browser] Extracted', results.length, 'Baidu search results');
+    return results.slice(0, 10);
+  }
+
+  // ========== Wikipedia Search Result Extraction ==========
+
+  function extractWikipediaSearchResults() {
+    const results = [];
+
+    // Wikipedia search results page DOM structure
+    // Primary: li.mw-search-result
+    // The search results page is at /w/index.php?search=QUERY
+
+    // Check if we're on a search results page
+    const searchResults = document.querySelectorAll('li.mw-search-result');
+
+    if (searchResults.length > 0) {
+      searchResults.forEach((item, index) => {
+        const headingEl = item.querySelector('.mw-search-result-heading a');
+        const title = headingEl ? headingEl.textContent.trim() : '';
+        let url = '';
+        if (headingEl && headingEl.href) {
+          // Make sure URL is absolute
+          if (headingEl.href.startsWith('/')) {
+            url = 'https://en.wikipedia.org' + headingEl.href;
+          } else {
+            url = headingEl.href;
+          }
+        }
+
+        const snippetEl = item.querySelector('.searchresult');
+        const snippet = snippetEl ? snippetEl.textContent.trim() : '';
+
+        if (title) {
+          results.push({
+            index: results.length + 1,
+            title: title,
+            url: url || ('https://en.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g, '_'))),
+            snippet: snippet
+          });
+        }
+      });
+    }
+
+    // Check if we landed directly on an article (not search results page)
+    if (results.length === 0 && document.querySelector('#content, #mw-content-text')) {
+      // We might have been redirected to the article directly
+      const titleEl = document.querySelector('#firstHeading, h1#firstHeading');
+      const title = titleEl ? titleEl.textContent.trim() : document.title.replace(' - Wikipedia', '').trim();
+
+      if (title) {
+        // Extract the first paragraph as the snippet
+        const introPs = document.querySelectorAll('#mw-content-text .mw-parser-output > p:not(.mw-empty-elt)');
+        let snippet = '';
+        for (const p of introPs) {
+          const text = p.textContent.trim();
+          if (text.length > 20) {
+            snippet = text.substring(0, 500);
+            break;
+          }
+        }
+
+        results.push({
+          index: 0,
+          title: title,
+          url: window.location.href,
+          snippet: snippet || 'Wikipedia article about "' + title + '"'
+        });
+      }
+    }
+
+    console.log('[AI Browser] Extracted', results.length, 'Wikipedia search results');
+    return results.slice(0, 10);
   }
 
   // ========== Deep Shadow DOM Text Extraction ==========

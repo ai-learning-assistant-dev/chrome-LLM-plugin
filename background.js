@@ -43,6 +43,53 @@ const PROVIDERS = {
   }
 };
 
+// Search engine registry — each engine opens a hidden tab, scrapes the DOM, then closes
+const SEARCH_ENGINES = {
+  bing: {
+    id: 'bing',
+    name: 'Bing',
+    searchUrl: (q) => 'https://www.bing.com/search?q=' + encodeURIComponent(q),
+    extractMessage: 'EXTRACT_BING_RESULTS',
+    toolName: 'web_search',
+    toolDescription: 'Search the web using Bing to get real-time information, verify facts, or find current data. Use this when the user asks for general web search, information that may not be in the page content, needs verification, or requires up-to-date data.',
+    searchUrlTemplate: 'https://www.bing.com/search?q={query}',
+    timeoutMs: 15000
+  },
+  google: {
+    id: 'google',
+    name: 'Google',
+    searchUrl: (q) => 'https://www.google.com/search?q=' + encodeURIComponent(q),
+    extractMessage: 'EXTRACT_GOOGLE_RESULTS',
+    toolName: 'web_search_google',
+    toolDescription: 'Search the web using Google to get real-time information, verify facts, or find current data. Google has broad coverage and is good for English-language queries.',
+    searchUrlTemplate: 'https://www.google.com/search?q={query}',
+    timeoutMs: 20000
+  },
+  baidu: {
+    id: 'baidu',
+    name: 'Baidu (百度)',
+    searchUrl: (q) => 'https://www.baidu.com/s?wd=' + encodeURIComponent(q),
+    extractMessage: 'EXTRACT_BAIDU_RESULTS',
+    toolName: 'web_search_baidu',
+    toolDescription: 'Search the web using Baidu (百度) for Chinese-language results. Baidu is the best search engine for Chinese content, news, and local information from China.',
+    searchUrlTemplate: 'https://www.baidu.com/s?wd={query}',
+    timeoutMs: 20000
+  },
+  wikipedia: {
+    id: 'wikipedia',
+    name: 'Wikipedia',
+    searchUrl: (q) => 'https://en.wikipedia.org/w/index.php?search=' + encodeURIComponent(q),
+    extractMessage: 'EXTRACT_WIKIPEDIA_RESULTS',
+    toolName: 'web_search_wikipedia',
+    toolDescription: 'Search Wikipedia for encyclopedic articles, definitions, and background information. Use this for factual knowledge, historical information, and academic topics.',
+    searchUrlTemplate: 'https://en.wikipedia.org/w/index.php?search={query}',
+    timeoutMs: 15000
+  }
+};
+
+// Default enabled search engines (Bing on by default for backward compatibility)
+const DEFAULT_ENABLED_ENGINES = { bing: true, google: false, baidu: false, wikipedia: false };
+
 // Track active stream AbortControllers keyed by senderTabId
 const activeStreams = {}; // senderTabId -> AbortController
 // Track active stream state so popup can reconnect after closing/reopening
@@ -221,6 +268,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.type === 'GET_SEARCH_ENGINES') {
+    sendResponse({ engines: SEARCH_ENGINES, defaults: DEFAULT_ENABLED_ENGINES });
+    return true;
+  }
+
   if (request.type === 'WEB_SEARCH') {
     performWebSearch(request.query, request.senderTabId)
       .then(results => sendResponse({ results }))
@@ -274,13 +326,24 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 // ===== Web Search =====
 
-// Perform a web search by opening a Bing search tab, extracting results, then closing it
-async function performWebSearch(query, senderTabId) {
-  const searchUrl = 'https://www.bing.com/search?q=' + encodeURIComponent(query);
+// Look up an engine config by its tool function name
+function getEngineByToolName(toolName) {
+  for (const [id, engine] of Object.entries(SEARCH_ENGINES)) {
+    if (engine.toolName === toolName) return engine;
+  }
+  return null;
+}
 
-  console.log('[WebSearch] Searching Bing for:', query);
+// Perform a web search by opening a search tab, extracting results, then closing it
+// engineId: one of 'bing' | 'google' | 'baidu' | 'wikipedia'
+async function performSearchWithEngine(query, engineId, senderTabId) {
+  const engine = SEARCH_ENGINES[engineId];
+  if (!engine) throw new Error('未知搜索引擎: ' + engineId);
 
-  // Create a new tab with the Bing search
+  const searchUrl = engine.searchUrl(query);
+  console.log('[WebSearch] Searching', engine.name, 'for:', query);
+
+  // Create a new tab with the search URL
   let tab;
   try {
     tab = await chrome.tabs.create({ url: searchUrl, active: false });
@@ -298,7 +361,7 @@ async function performWebSearch(query, senderTabId) {
   try {
     // Wait for the tab to finish loading
     let loaded = false;
-    const maxWaitMs = 15000; // 15 second timeout
+    const maxWaitMs = engine.timeoutMs;
     const pollIntervalMs = 500;
 
     const tabLoadPromise = new Promise((resolve, reject) => {
@@ -336,7 +399,7 @@ async function performWebSearch(query, senderTabId) {
         clearInterval(pollInterval);
         chrome.tabs.onUpdated.removeListener(updateListener);
         if (!loaded) {
-          reject(new Error('搜索页面加载超时'));
+          reject(new Error(engine.name + '搜索页面加载超时'));
         }
       }, maxWaitMs);
 
@@ -353,11 +416,11 @@ async function performWebSearch(query, senderTabId) {
     await tabLoadPromise;
     console.log('[WebSearch] Search tab loaded, extracting results...');
 
-    // Extract results from the Bing page
-    const extractResp = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_BING_RESULTS' });
+    // Extract results from the search page
+    const extractResp = await chrome.tabs.sendMessage(tabId, { type: engine.extractMessage });
 
     const results = (extractResp && extractResp.results) ? extractResp.results : [];
-    console.log('[WebSearch] Extracted', results.length, 'results');
+    console.log('[WebSearch] Extracted', results.length, 'results from', engine.name);
 
     // Close the search tab
     try {
@@ -377,6 +440,12 @@ async function performWebSearch(query, senderTabId) {
     }
     throw error;
   }
+}
+
+// Legacy wrapper — kept for backward compatibility (Bing default)
+// Perform a web search by opening a Bing search tab, extracting results, then closing it
+async function performWebSearch(query, senderTabId) {
+  return performSearchWithEngine(query, 'bing', senderTabId);
 }
 
 async function fetchModels(config) {
@@ -780,20 +849,22 @@ async function processStreamResponse(response, endpoint, config, messages, tools
     const sortedCalls = Object.keys(toolCalls).sort().map(k => toolCalls[k]);
 
     for (const toolCall of sortedCalls) {
-      if (toolCall.name === 'web_search') {
+      const engine = getEngineByToolName(toolCall.name);
+      if (engine) {
         try {
           const args = JSON.parse(toolCall.arguments || '{}');
           const query = args.query || '';
-          console.log('[DEBUG] Executing web_search for:', query);
+          console.log('[DEBUG] Executing', engine.toolName, 'for:', query);
 
           // Show search link immediately before the async search
-          fullContent += '\n\n🔍 **[' + query + '](https://www.bing.com/search?q=' + encodeURIComponent(query) + ')**';
+          const searchLinkUrl = engine.searchUrlTemplate.replace('{query}', encodeURIComponent(query));
+          fullContent += '\n\n🔍 **[' + query + '](' + searchLinkUrl + ')**';
           if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
           chrome.runtime.sendMessage({
             type: 'STREAM_CHUNK', messageId, content: fullContent, done: false, senderTabId
           }).catch(() => {});
 
-          const searchResults = await performWebSearch(query, senderTabId);
+          const searchResults = await performSearchWithEngine(query, engine.id, senderTabId);
 
           // Format results for the AI
           const resultsText = searchResults.length > 0
@@ -808,13 +879,13 @@ async function processStreamResponse(response, endpoint, config, messages, tools
 
           fullContent += ' — ' + (searchResults.length > 0 ? '找到 ' + searchResults.length + ' 条结果\n' : '没有找到结果\n');
 
-          console.log('[DEBUG] Web search completed, got', searchResults.length, 'results');
+          console.log('[DEBUG]', engine.name, 'search completed, got', searchResults.length, 'results');
         } catch (e) {
           console.error('[DEBUG] Web search error:', e);
           toolResults.push({
             tool_call_id: toolCall.id,
             role: 'tool',
-            content: '搜索出错: ' + e.message
+            content: engine.name + '搜索出错: ' + e.message
           });
         }
       } else {
@@ -980,19 +1051,21 @@ async function processStreamResponse(response, endpoint, config, messages, tools
           // Execute each new tool call
           const sortedRoundCalls = Object.keys(roundToolCalls).sort().map(k => roundToolCalls[k]);
           for (const tc of sortedRoundCalls) {
-            if (tc.name === 'web_search') {
+            const engine = getEngineByToolName(tc.name);
+            if (engine) {
               try {
                 const args = JSON.parse(tc.arguments || '{}');
                 const query = args.query || '';
 
                 // Show search link immediately before the async search
-                fullContent += '\n\n🔍 **[' + query + '](https://www.bing.com/search?q=' + encodeURIComponent(query) + ')**';
+                const searchLinkUrl = engine.searchUrlTemplate.replace('{query}', encodeURIComponent(query));
+                fullContent += '\n\n🔍 **[' + query + '](' + searchLinkUrl + ')**';
                 if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
                 chrome.runtime.sendMessage({
                   type: 'STREAM_CHUNK', messageId, content: fullContent, done: false, senderTabId
                 }).catch(() => {});
 
-                const searchResults = await performWebSearch(query, senderTabId);
+                const searchResults = await performSearchWithEngine(query, engine.id, senderTabId);
 
                 const resultsText = searchResults.length > 0
                   ? JSON.stringify(searchResults, null, 2)
@@ -1010,7 +1083,7 @@ async function processStreamResponse(response, endpoint, config, messages, tools
                 followUpMessages.push({
                   tool_call_id: tc.id,
                   role: 'tool',
-                  content: '搜索出错: ' + e.message
+                  content: (engine ? engine.name : '搜索') + '出错: ' + e.message
                 });
               }
             }

@@ -8,6 +8,8 @@ let streamingMessageId = null; // Track current streaming message
 let streamingMessageElement = null; // DOM element for streaming message
 let streamingContent = ''; // Accumulated streaming content
 let isFirstChunkAfterStreamStart = false; // Flag for first chunk scrolling behavior
+let searchEngines = null; // Search engine registry fetched from background
+let enabledSearchEngines = { bing: true, google: false, baidu: false, wikipedia: false }; // Engine toggles
 
 // DOM Elements
 const chatContainer = document.getElementById('chatContainer');
@@ -68,11 +70,27 @@ const PROVIDERS = {
 
 // Load saved configuration
 async function loadConfig() {
-  const result = await chrome.storage.local.get(['provider', 'apiKey', 'model', 'customEndpoint']);
+  const result = await chrome.storage.local.get(['provider', 'apiKey', 'model', 'customEndpoint', 'searchEngines']);
   if (result.provider) providerSelect.value = result.provider;
   if (result.apiKey) apiKeyInput.value = result.apiKey;
   if (result.model) {}
   if (result.customEndpoint) customEndpointInput.value = result.customEndpoint;
+
+  // Load search engine preferences
+  if (result.searchEngines) {
+    enabledSearchEngines = result.searchEngines;
+  }
+
+  // Fetch search engine registry from background
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'GET_SEARCH_ENGINES' });
+    if (resp && resp.engines) {
+      searchEngines = resp.engines;
+      // Apply saved toggles to checkbox state later (after DOM is fully loaded)
+    }
+  } catch (e) {
+    console.error('Failed to fetch search engines:', e);
+  }
 
   customEndpointRow.classList.toggle('show', providerSelect.value === 'custom');
   updateModelSelectState();
@@ -222,13 +240,31 @@ function buildSystemContent() {
 
     systemContent += `Please answer the user's questions based on this content. Be helpful and concise.
 
-You have access to a web_search tool. You may use it up to 3 times total per response. Use it when:
+You have access to web search tools (up to 3 uses total per response). Available search engines: `;
+
+    // List available engines
+    const availableEngines = Object.entries(searchEngines || {}).filter(([id]) => enabledSearchEngines[id]);
+    if (availableEngines.length > 0) {
+      systemContent += availableEngines.map(([id, eng]) => eng.name).join(', ') + '.';
+    } else {
+      systemContent += 'None enabled.';
+    }
+
+    systemContent += `
+
+Use web search when:
 - The user asks you to verify/fact-check information
 - The user needs real-time/current information not present in the page content
 - The user explicitly asks you to search for something
 - You are uncertain about a claim and need to verify it
 
-To search, use the web_search function with your search query. The search will return results from Bing including titles, URLs, and snippets. Use these results to provide accurate, up-to-date answers with source citations.
+Choose the most appropriate search engine for the query type:
+- ` + (searchEngines && searchEngines.bing ? 'web_search: General web search via Bing for broad English-language queries' : '') + `
+- ` + (searchEngines && searchEngines.google ? 'web_search_google: Google search, good for English queries and broad coverage' : '') + `
+- ` + (searchEngines && searchEngines.baidu ? 'web_search_baidu: Baidu (百度), best for Chinese-language content, news, and local China information' : '') + `
+- ` + (searchEngines && searchEngines.wikipedia ? 'web_search_wikipedia: Wikipedia, best for encyclopedic articles, definitions, and factual background' : '') + `
+
+Search results include titles, URLs, and snippets. Use these to provide accurate, up-to-date answers with source citations.
 
 If you run out of searches, answer based on what you already found. If no results were found, state that honestly.`;
   }
@@ -676,6 +712,34 @@ async function refreshPageContext() {
   return false;
 }
 
+// Build tool definitions based on enabled search engines
+function buildSearchTools() {
+  if (!searchEngines) return [];
+
+  const tools = [];
+  for (const [id, engine] of Object.entries(searchEngines)) {
+    if (!enabledSearchEngines[id]) continue;
+    tools.push({
+      type: 'function',
+      function: {
+        name: engine.toolName,
+        description: engine.toolDescription,
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'The search query. Be specific and use keywords for best results.'
+            }
+          },
+          required: ['query']
+        }
+      }
+    });
+  }
+  return tools;
+}
+
 // Send message
 async function sendMessage() {
   const text = userInput.value.trim();
@@ -731,24 +795,8 @@ async function sendMessage() {
     const actualModel = model || (provider === 'custom' ? 'custom-model' : '');
     const config = { provider, apiKey, model: actualModel, customEndpoint };
 
-    // Include tool definitions for web_search
-    const tools = [{
-      type: 'function',
-      function: {
-        name: 'web_search',
-        description: 'Search the web using Bing to get real-time information, verify facts, or find current data. Use this when the user asks for information that may not be in the page content, needs verification, or requires up-to-date data.',
-        parameters: {
-          type: 'object',
-          properties: {
-            query: {
-              type: 'string',
-              description: 'The search query to send to Bing. Be specific and use keywords for best results.'
-            }
-          },
-          required: ['query']
-        }
-      }
-    }];
+    // Include tool definitions for enabled search engines
+    const tools = buildSearchTools();
 
     // Send request - for streaming, we don't wait for response here
     // The streaming chunks will come back via chrome.runtime.onMessage
@@ -1003,3 +1051,42 @@ fontSizeSlider.addEventListener('change', async () => {
 
 // Initialize font size on load
 loadFontSize();
+
+// ============ Search Engine Toggles ============
+
+// Apply saved engine toggles to checkbox state
+function applySearchEngineToggles() {
+  document.querySelectorAll('.engine-toggle input[type="checkbox"]').forEach(cb => {
+    const engineId = cb.dataset.engine;
+    if (engineId && enabledSearchEngines.hasOwnProperty(engineId)) {
+      cb.checked = enabledSearchEngines[engineId];
+    }
+  });
+}
+
+// Save search engine toggles
+async function saveSearchEngineToggles() {
+  await chrome.storage.local.set({ searchEngines: enabledSearchEngines });
+}
+
+// Attach change handlers to all engine toggle checkboxes
+document.querySelectorAll('.engine-toggle input[type="checkbox"]').forEach(cb => {
+  cb.addEventListener('change', async () => {
+    const engineId = cb.dataset.engine;
+    if (engineId) {
+      enabledSearchEngines[engineId] = cb.checked;
+      await saveSearchEngineToggles();
+      console.log('[POPUP] Search engine', engineId, cb.checked ? 'enabled' : 'disabled');
+    }
+  });
+});
+
+// Apply toggles after DOM is loaded and config is fetched
+if (searchEngines) {
+  applySearchEngineToggles();
+} else {
+  // Retry after a short delay if searchEngines hasn't loaded yet
+  setTimeout(() => {
+    if (searchEngines) applySearchEngineToggles();
+  }, 1000);
+}
