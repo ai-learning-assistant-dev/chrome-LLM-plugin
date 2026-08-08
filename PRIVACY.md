@@ -34,7 +34,28 @@ The supported API providers are:
 
 The extension also fetches available model lists from your configured API provider to enable model selection.
 
-For Bilibili pages, the extension makes requests to Bilibili's public APIs (`api.bilibili.com`) from your browser to retrieve video metadata, subtitle information, and user comments. These requests use your existing browser cookies for authentication and do not transmit data to any third party beyond Bilibili's own servers.
+### Web Search
+
+The extension provides AI-powered web search through supported search engines (Bing, Google, Baidu, Wikipedia). When the AI decides to use a search tool:
+
+- The extension opens a hidden browser tab to the search engine's URL with your search query
+- It extracts the search result titles, URLs, and snippets from the loaded page
+- The search tab is automatically closed after extraction
+- Search results are sent to your configured AI API as part of the ongoing conversation for the AI to synthesize a response
+
+**Your search queries are transmitted to the respective search engine** (Bing, Google, Baidu, or Wikipedia) as part of the search URL, just as they would be if you visited the search engine directly. These requests are subject to each search engine's own privacy policy.
+
+You can enable or disable individual search engines at any time in the extension settings.
+
+### Bilibili Integration
+
+For Bilibili pages, the extension makes requests to Bilibili's public APIs (`api.bilibili.com`) from your browser to retrieve:
+
+- Video metadata and chapter information (`x/web-interface/view`)
+- Subtitle information and content (`x/player/wbi/v2`)
+- User comments (`x/v2/reply/wbi/main`)
+
+These requests use your existing browser cookies for authentication and do not transmit data to any third party beyond Bilibili's own servers.
 
 ## Data Storage
 
@@ -43,6 +64,7 @@ This extension stores the following data **locally in your browser** (`chrome.st
 - Your selected API provider and API key
 - Your selected model
 - Your custom API endpoint (if configured)
+- Your search engine preferences (enabled/disabled)
 - Conversation history per tab (to preserve your chat across page reloads), including the associated page context (title, URL, text content, subtitles, and comments)
 - UI preferences (such as font size)
 
@@ -54,19 +76,23 @@ The "翻译此段落" (Translate Paragraph) right-click context menu feature:
 
 - Tracks which page element you right-click on (via a `contextmenu` event listener) to identify the paragraph to translate
 - Sends the selected paragraph's text to your configured AI API for translation into Simplified Chinese
-- Injects the translation result directly into the webpage as an inline block below the original paragraph
+- Inserts a loading placeholder directly into the webpage, then streams the translation result as inline content below the original paragraph
+- Translated content is rendered in a styled block with a delete button — clicking delete removes the translation block from the page
 - **Does not** persistently store translated text or track your browsing behavior
 
 ## Third-Party Services
 
 This extension relies entirely on third-party AI API services configured by you. Your use of those services (including their data collection practices) is governed by the privacy policies of those respective service providers.
 
+Web search queries are sent to the respective search engines (Bing, Google, Baidu, Wikipedia) and are subject to each search engine's privacy policy.
+
 ## Permissions
 
 - `storage`: Store your configuration and conversation history locally
 - `sidePanel`: Enable the side panel interface
 - `contextMenus`: Provide the right-click "翻译此段落" (Translate Paragraph) option
-- Host permissions (`https://*/`, `http://*/`): Required to extract content from and communicate with the webpages you visit, to reach your configured API endpoints, and to call Bilibili's public APIs for subtitle and comment extraction
+- `tabs`: Open hidden search engine tabs for web search, and identify the active content tab to associate conversations with the correct webpage. The extension does not read or track your open tabs beyond identifying which page you are actively viewing.
+- Host permissions (`https://*/`, `http://*/`, `https://api.anthropic.com/*`): Required to inject content scripts into webpages for text extraction and translation, to open search engine pages for web search, to reach your configured API endpoints, and to call Bilibili's public APIs for subtitle and comment extraction
 
 ## Changes
 
