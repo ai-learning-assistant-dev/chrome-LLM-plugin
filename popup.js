@@ -225,6 +225,68 @@ const PROVIDERS = {
 // View helpers — pure DOM manipulation
 // =============================================================================
 
+// Allowed tags/attributes for AI-generated Markdown content
+const ALLOWED_TAGS = new Set([
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'p', 'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+  'a', 'strong', 'b', 'em', 'i', 'u', 's', 'del', 'sub', 'sup',
+  'code', 'pre', 'blockquote',
+  'table', 'thead', 'tbody', 'tr', 'th', 'td',
+  'hr', 'br', 'img', 'span', 'div',
+  'section', 'article', 'header', 'footer'
+]);
+
+const ALLOWED_ATTRS = new Set([
+  'href', 'src', 'alt', 'title', 'class', 'id', 'target', 'rel',
+  'width', 'height', 'colspan', 'rowspan', 'scope'
+]);
+
+function sanitizeHTML(html) {
+  try {
+    const doc = new DOMParser().parseFromString('<div>' + html + '</div>', 'text/html');
+    const container = doc.body.firstChild;
+
+    function cleanNode(node) {
+      if (node.nodeType === Node.TEXT_NODE) return;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        if (!ALLOWED_TAGS.has(node.tagName.toLowerCase())) {
+          // Replace disallowed tag with its text content
+          const text = node.textContent;
+          node.replaceWith(document.createTextNode(text));
+          return;
+        }
+        // Remove disallowed attributes
+        const attrsToRemove = [];
+        for (const attr of node.attributes) {
+          if (!ALLOWED_ATTRS.has(attr.name.toLowerCase())) {
+            attrsToRemove.push(attr.name);
+          } else if (attr.name.toLowerCase() === 'href' && attr.value.trim().toLowerCase().startsWith('javascript:')) {
+            attrsToRemove.push(attr.name);
+          }
+        }
+        for (const name of attrsToRemove) {
+          node.removeAttribute(name);
+        }
+        // Recursively clean children (iterate backwards since we may replace nodes)
+        let child = node.firstChild;
+        while (child) {
+          const next = child.nextSibling;
+          cleanNode(child);
+          child = next;
+        }
+      }
+    }
+
+    cleanNode(container);
+    return container.innerHTML;
+  } catch (e) {
+    // Fallback: return text-only version
+    const div = document.createElement('div');
+    div.textContent = html;
+    return div.innerHTML;
+  }
+}
+
 function addMessage(role, content) {
   const msg = document.createElement('div');
   msg.className = `message ${role}`;
@@ -233,7 +295,7 @@ function addMessage(role, content) {
   if (role === 'assistant' && typeof marked !== 'undefined' && content) {
     const parsed = marked.parse(content);
     if (parsed && parsed.trim()) {
-      msg.innerHTML = parsed;
+      msg.innerHTML = sanitizeHTML(parsed);
     } else {
       msg.textContent = content;
     }
@@ -287,7 +349,7 @@ function renderStreamingMessage(tabId) {
     if (activeStreamEl) {
       const currentFontSize = fontSizeSlider?.value || 12;
       if (typeof marked !== 'undefined' && content) {
-        activeStreamEl.innerHTML = marked.parse(content);
+        activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content));
       } else {
         activeStreamEl.textContent = content || '(已停止生成)';
       }
@@ -322,7 +384,7 @@ function renderStreamingMessage(tabId) {
     }
 
     if (typeof marked !== 'undefined' && content) {
-      activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+      activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content)) + '<span class="streaming-cursor">▊</span>';
     } else if (content) {
       activeStreamEl.textContent = content;
     } else {
@@ -406,7 +468,7 @@ async function switchToTab(tabId) {
     activeStreamEl.style.fontSize = currentFontSize + 'px';
     const content = streaming.content || '';
     if (typeof marked !== 'undefined' && content) {
-      activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+      activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content)) + '<span class="streaming-cursor">▊</span>';
     } else if (content) {
       activeStreamEl.textContent = content;
     } else {
@@ -772,7 +834,7 @@ function stopStream() {
     const currentFontSize = fontSizeSlider?.value || 12;
     const content = streaming.content || '';
     if (typeof marked !== 'undefined' && content) {
-      activeStreamEl.innerHTML = marked.parse(content);
+      activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content));
     } else {
       activeStreamEl.textContent = content || '(已停止生成)';
     }
@@ -872,7 +934,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         activeStreamEl.style.fontSize = currentFontSize + 'px';
         const content = streamState.content || '';
         if (typeof marked !== 'undefined' && content) {
-          activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+          activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content)) + '<span class="streaming-cursor">▊</span>';
         } else if (content) {
           activeStreamEl.textContent = content;
         } else {
@@ -955,7 +1017,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (activeStreamEl) {
           const currentFontSize = fontSizeSlider?.value || 12;
           if (typeof marked !== 'undefined' && content) {
-            activeStreamEl.innerHTML = marked.parse(content);
+            activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content));
           } else {
             activeStreamEl.textContent = content || '(已停止生成)';
           }
@@ -984,7 +1046,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         activeStreamEl.style.fontSize = currentFontSize + 'px';
 
         if (typeof marked !== 'undefined' && content) {
-          activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+          activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content)) + '<span class="streaming-cursor">▊</span>';
         } else if (content) {
           activeStreamEl.textContent = content;
         } else {
@@ -1013,7 +1075,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         if (typeof marked !== 'undefined' && content) {
-          activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+          activeStreamEl.innerHTML = sanitizeHTML(marked.parse(content)) + '<span class="streaming-cursor">▊</span>';
         } else {
           activeStreamEl.textContent = content;
         }
@@ -1037,7 +1099,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (isActive) {
       if (activeStreamEl) {
         const currentFontSize = fontSizeSlider?.value || 12;
-        activeStreamEl.innerHTML = `<span class="error">错误: ${request.error || '未知错误'}</span>`;
+        const errorSpan = document.createElement('span');
+        errorSpan.className = 'error';
+        errorSpan.textContent = `错误: ${request.error || '未知错误'}`;
+        activeStreamEl.textContent = '';
+        activeStreamEl.appendChild(errorSpan);
         activeStreamEl.style.fontSize = currentFontSize + 'px';
         activeStreamEl.classList.remove('streaming');
         activeStreamEl = null;

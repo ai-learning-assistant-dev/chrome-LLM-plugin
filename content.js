@@ -820,12 +820,14 @@ async function extractBilibiliComments() {
     translationBlock.innerHTML =
       '<div class="ai-translation-header">' +
         '<span class="ai-translation-label">🌐 中文翻译</span>' +
-        '<button class="ai-translation-delete-btn" data-ai-trans-id="' + id + '">✕ 删除</button>' +
+        '<button class="ai-translation-delete-btn">✕ 删除</button>' +
       '</div>' +
       '<div class="ai-translation-content">' +
         '<span class="ai-loading-spinner"></span> 翻译中，请稍候...' +
       '</div>';
 
+    const deleteBtn = translationBlock.querySelector('.ai-translation-delete-btn');
+    if (deleteBtn) deleteBtn.dataset.aiTransId = id;
     originalEl.insertAdjacentElement('afterend', translationBlock);
     console.log('[AI Browser] Inserted translation placeholder, id:', id);
     return id;
@@ -844,7 +846,8 @@ async function extractBilibiliComments() {
       // Show error state only on explicit error
       if (isError) {
         block.classList.remove('ai-translation-loading');
-        contentEl.innerHTML = '<span style="color: #c0392b;">⚠️ 翻译失败，请重试</span>';
+        contentEl.textContent = '⚠️ 翻译失败，请重试';
+        contentEl.style.color = '#c0392b';
       }
     } else {
       // Remove loading spinner on first text chunk (streaming)
