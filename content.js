@@ -540,23 +540,28 @@ async function extractBilibiliComments() {
   }
 
   // Update a translation placeholder with real content (or error state)
+  // Supports streaming: removes loading spinner on first update, appends text progressively
   function updateTranslationContent(placeholderId, translatedText, isError) {
     const block = document.querySelector('.ai-translation-block[data-ai-trans-id="' + placeholderId + '"]');
     if (!block) return;
 
-    block.classList.remove('ai-translation-loading');
     const contentEl = block.querySelector('.ai-translation-content');
     if (!contentEl) return;
 
     if (isError || !translatedText || !translatedText.trim()) {
-      // Show error state
-      contentEl.innerHTML = '<span style="color: #c0392b;">⚠️ 翻译失败，请重试</span>';
+      // Show error state only on explicit error
+      if (isError) {
+        block.classList.remove('ai-translation-loading');
+        contentEl.innerHTML = '<span style="color: #c0392b;">⚠️ 翻译失败，请重试</span>';
+      }
     } else {
-      // Show real translation
+      // Remove loading spinner on first text chunk (streaming)
+      block.classList.remove('ai-translation-loading');
+      // Use textContent for streaming — fast and safe (no HTML injection)
       contentEl.textContent = translatedText;
     }
 
-    console.log('[AI Browser] Updated translation, id:', placeholderId, 'error:', !!isError);
+    console.log('[AI Browser] Updated translation, id:', placeholderId, 'error:', !!isError, 'length:', (translatedText || '').length);
   }
 
   // Event delegation for delete button clicks on translation blocks

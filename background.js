@@ -95,7 +95,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const placeholderId = (placeholderResp && placeholderResp.placeholderId) ? placeholderResp.placeholderId : -1;
 
     try {
-      // Step 4: Translate
+      // Step 4: Translate (streaming)
       const systemPrompt = `You are a professional translator. Translate the following text into Simplified Chinese (简体中文).
 
 Rules:
@@ -104,16 +104,16 @@ Rules:
 3. If the text is already in Chinese, return it unchanged
 4. If the text is code or a technical term that should not be translated, return it unchanged`;
 
-      const result = await translateBatch(config, [
+      const result = await translateBatchStreaming(config, [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: originalText }
-      ]);
+      ], tab.id, placeholderId);
 
       const translatedText = result.content ? result.content.trim() : '';
 
       if (!translatedText) {
         console.log('[Translation] Empty translation result');
-        // Update placeholder with error
+        // Update placeholder with error (content already streamed if partial)
         await chrome.tabs.sendMessage(tab.id, {
           type: 'UPDATE_TRANSLATION',
           placeholderId: placeholderId,
@@ -124,14 +124,6 @@ Rules:
       }
 
       console.log('[Translation] Result:', translatedText.substring(0, 80) + '...');
-
-      // Step 5: Update the placeholder with real translation
-      await chrome.tabs.sendMessage(tab.id, {
-        type: 'UPDATE_TRANSLATION',
-        placeholderId: placeholderId,
-        translatedText: translatedText,
-        error: false
-      });
 
     } catch (translateError) {
       console.error('[Translation] Translation error:', translateError);
@@ -441,7 +433,7 @@ async function fetchModels(config) {
 }
 
 // Non-streaming LLM call for translation (returns full response at once)
-async function translateBatch(config, messages) {
+async function translateBatchStreaming(config, messages, tabId, placeholderId) {
   const { provider, apiKey, model, customEndpoint } = config;
 
   if (!apiKey) throw new Error('请先填写 API Key');
@@ -458,7 +450,7 @@ async function translateBatch(config, messages) {
   const body = {
     model: model,
     messages: messages,
-    stream: false
+    stream: true
   };
 
   const response = await fetch(endpoint, {
@@ -479,8 +471,76 @@ async function translateBatch(config, messages) {
     throw new Error(errorMsg);
   }
 
-  const data = await response.json();
-  return { content: data.choices?.[0]?.message?.content || '' };
+  // Process SSE stream
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullContent = '';
+  let lastSend = 0;
+  const SEND_INTERVAL = 80; // ms between updates to throttle DOM writes
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(data);
+            const content = parsed.choices?.[0]?.delta?.content || '';
+            if (content) {
+              fullContent += content;
+
+              // Throttle updates to avoid flooding the content script
+              const now = Date.now();
+              if (now - lastSend >= SEND_INTERVAL) {
+                lastSend = now;
+                await chrome.tabs.sendMessage(tabId, {
+                  type: 'UPDATE_TRANSLATION',
+                  placeholderId: placeholderId,
+                  translatedText: fullContent,
+                  error: false
+                }).catch(() => {});
+              }
+            }
+          } catch (e) { /* skip invalid JSON */ }
+        }
+      }
+    }
+
+    // Flush any remaining line in buffer
+    if (buffer.startsWith('data: ')) {
+      const data = buffer.slice(6).trim();
+      if (data !== '[DONE]') {
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content || '';
+          if (content) {
+            fullContent += content;
+          }
+        } catch (e) { /* skip */ }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+    // Always send the final complete translation
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'UPDATE_TRANSLATION',
+      placeholderId: placeholderId,
+      translatedText: fullContent,
+      error: false
+    }).catch(() => {});
+  }
+
+  return { content: fullContent };
 }
 
 async function sendToLLM(config, messages, tools, senderTabId) {
