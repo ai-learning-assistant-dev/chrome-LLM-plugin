@@ -858,7 +858,7 @@ async function processStreamResponse(response, endpoint, config, messages, tools
 
           // Show search link immediately before the async search
           const searchLinkUrl = engine.searchUrlTemplate.replace('{query}', encodeURIComponent(query));
-          fullContent += '\n\n🔍 **[' + query + '](' + searchLinkUrl + ')**';
+          fullContent += '\n\n[' + engine.name + '] 🔍 **[' + query + '](' + searchLinkUrl + ')**';
           if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
           chrome.runtime.sendMessage({
             type: 'STREAM_CHUNK', messageId, content: fullContent, done: false, senderTabId
@@ -1059,7 +1059,7 @@ async function processStreamResponse(response, endpoint, config, messages, tools
 
                 // Show search link immediately before the async search
                 const searchLinkUrl = engine.searchUrlTemplate.replace('{query}', encodeURIComponent(query));
-                fullContent += '\n\n🔍 **[' + query + '](' + searchLinkUrl + ')**';
+                fullContent += '\n\n[' + engine.name + '] 🔍 **[' + query + '](' + searchLinkUrl + ')**';
                 if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
                 chrome.runtime.sendMessage({
                   type: 'STREAM_CHUNK', messageId, content: fullContent, done: false, senderTabId
