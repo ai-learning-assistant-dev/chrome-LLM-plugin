@@ -725,15 +725,11 @@ async function processStreamResponse(response, endpoint, config, messages, tools
           const query = args.query || '';
           console.log('[DEBUG] Executing web_search for:', query);
 
-          // Send search notification
-          fullContent = fullContent + '\n\n🔍 *正在搜索: ' + query + '...*';
+          // Show search link immediately before the async search
+          fullContent += '\n\n🔍 **[' + query + '](https://www.bing.com/search?q=' + encodeURIComponent(query) + ')**';
           if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
           chrome.runtime.sendMessage({
-            type: 'STREAM_CHUNK',
-            messageId,
-            content: fullContent,
-            done: false,
-            senderTabId
+            type: 'STREAM_CHUNK', messageId, content: fullContent, done: false, senderTabId
           }).catch(() => {});
 
           const searchResults = await performWebSearch(query, senderTabId);
@@ -749,14 +745,7 @@ async function processStreamResponse(response, endpoint, config, messages, tools
             content: resultsText
           });
 
-          fullContent += '\n\n🔍 **搜索结果: ' + query + '**\n';
-          if (searchResults.length > 0) {
-            searchResults.forEach((r, i) => {
-              fullContent += (i + 1) + '. [' + r.title + '](' + r.url + ')\n';
-            });
-          } else {
-            fullContent += '没有找到结果\n';
-          }
+          fullContent += ' — ' + (searchResults.length > 0 ? '找到 ' + searchResults.length + ' 条结果\n' : '没有找到结果\n');
 
           console.log('[DEBUG] Web search completed, got', searchResults.length, 'results');
         } catch (e) {
@@ -935,7 +924,8 @@ async function processStreamResponse(response, endpoint, config, messages, tools
                 const args = JSON.parse(tc.arguments || '{}');
                 const query = args.query || '';
 
-                fullContent += '\n\n🔍 *正在搜索: ' + query + '...*';
+                // Show search link immediately before the async search
+                fullContent += '\n\n🔍 **[' + query + '](https://www.bing.com/search?q=' + encodeURIComponent(query) + ')**';
                 if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
                 chrome.runtime.sendMessage({
                   type: 'STREAM_CHUNK', messageId, content: fullContent, done: false, senderTabId
@@ -953,14 +943,7 @@ async function processStreamResponse(response, endpoint, config, messages, tools
                   content: resultsText
                 });
 
-                fullContent += '\n\n🔍 **搜索结果: ' + query + '**\n';
-                if (searchResults.length > 0) {
-                  searchResults.forEach((r, i) => {
-                    fullContent += (i + 1) + '. [' + r.title + '](' + r.url + ')\n';
-                  });
-                } else {
-                  fullContent += '没有找到结果\n';
-                }
+                fullContent += ' — ' + (searchResults.length > 0 ? '找到 ' + searchResults.length + ' 条结果\n' : '没有找到结果\n');
                 if (streamSessions[senderTabId]) streamSessions[senderTabId].content = fullContent;
               } catch (e) {
                 followUpMessages.push({
