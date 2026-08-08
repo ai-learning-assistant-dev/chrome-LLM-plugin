@@ -1,15 +1,197 @@
 // Popup script - handles multiple LLM providers
-let pageContext = null;
-let conversationHistory = [];
+// =============================================================================
+// TabDataStore — central data layer for all per-tab state
+// Data lives as long as the extension page is open (sidepanel mode).
+// View just switches which tab's data it renders — no data is destroyed on tab switch.
+// =============================================================================
+
+class TabDataStore {
+  constructor() {
+    this._tabs = {}; // tabId -> { tabId, pageContext, conversationHistory, streaming, dirty }
+  }
+
+  // ---- internal helpers ----
+  _storageKey(tabId) {
+    return `conversation_${tabId}`;
+  }
+
+  _ensure(tabId) {
+    if (!this._tabs[tabId]) {
+      this._tabs[tabId] = {
+        tabId,
+        pageContext: null,
+        conversationHistory: [],
+        streaming: null, // { messageId, content, done, stopped, toolMessages }
+        dirty: false
+      };
+    }
+    return this._tabs[tabId];
+  }
+
+  // ---- lifecycle ----
+  getOrCreate(tabId) {
+    return this._ensure(tabId);
+  }
+
+  remove(tabId) {
+    delete this._tabs[tabId];
+  }
+
+  // ---- conversation operations ----
+  getConversation(tabId) {
+    return this._ensure(tabId).conversationHistory;
+  }
+
+  appendMessage(tabId, message) {
+    const t = this._ensure(tabId);
+    t.conversationHistory.push(message);
+    t.dirty = true;
+  }
+
+  appendToolMessages(tabId, msgs) {
+    const t = this._ensure(tabId);
+    for (const m of msgs) {
+      t.conversationHistory.push(m);
+    }
+    t.dirty = true;
+  }
+
+  setConversation(tabId, history) {
+    const t = this._ensure(tabId);
+    t.conversationHistory = history;
+    t.dirty = false; // just loaded, not dirty
+  }
+
+  clearConversation(tabId) {
+    const t = this._ensure(tabId);
+    t.conversationHistory = [];
+    t.dirty = true;
+  }
+
+  // ---- streaming operations (pure memory, no persistence) ----
+  startStreaming(tabId, messageId) {
+    const t = this._ensure(tabId);
+    t.streaming = { messageId, content: '', done: false, stopped: false, toolMessages: [] };
+  }
+
+  updateStreamContent(tabId, content) {
+    const t = this._ensure(tabId);
+    if (t.streaming) t.streaming.content = content;
+  }
+
+  updateStreamDone(tabId, done) {
+    const t = this._ensure(tabId);
+    if (t.streaming) t.streaming.done = done;
+  }
+
+  updateStreamToolMessages(tabId, toolMessages) {
+    const t = this._ensure(tabId);
+    if (t.streaming) t.streaming.toolMessages = toolMessages;
+  }
+
+  getStreaming(tabId) {
+    const t = this._tabs[tabId];
+    return t ? t.streaming : null;
+  }
+
+  stopStreaming(tabId) {
+    const t = this._ensure(tabId);
+    if (!t.streaming) return '';
+    t.streaming.done = true;
+    t.streaming.stopped = true;
+    return t.streaming.content;
+  }
+
+  finalizeStreaming(tabId) {
+    const t = this._ensure(tabId);
+    if (!t.streaming) return;
+    const s = t.streaming;
+    if (s.content) {
+      t.conversationHistory.push({ role: 'assistant', content: s.content });
+    }
+    if (s.toolMessages && s.toolMessages.length > 0) {
+      for (const tm of s.toolMessages) {
+        t.conversationHistory.push(tm);
+      }
+    }
+    t.streaming = null;
+    t.dirty = true;
+  }
+
+  // ---- page context ----
+  getPageContext(tabId) {
+    const t = this._tabs[tabId];
+    return t ? t.pageContext : null;
+  }
+
+  setPageContext(tabId, ctx) {
+    this._ensure(tabId).pageContext = ctx;
+  }
+
+  // ---- persistence ----
+  async persist(tabId) {
+    const t = this._tabs[tabId];
+    if (!t) return;
+    try {
+      const key = this._storageKey(tabId);
+      await chrome.storage.local.set({
+        [key]: {
+          history: t.conversationHistory,
+          pageContext: t.pageContext,
+          savedAt: Date.now()
+        }
+      });
+      t.dirty = false;
+    } catch (error) {
+      console.error('[DataStore] Error saving conversation:', error);
+    }
+  }
+
+  async load(tabId) {
+    try {
+      const key = this._storageKey(tabId);
+      const result = await chrome.storage.local.get([key]);
+      if (result[key]) {
+        const t = this._ensure(tabId);
+        t.conversationHistory = result[key].history || [];
+        if (result[key].pageContext) {
+          t.pageContext = result[key].pageContext;
+        }
+        t.dirty = false;
+        return result[key];
+      }
+    } catch (error) {
+      console.error('[DataStore] Error loading conversation:', error);
+    }
+    return null;
+  }
+
+  async removePersisted(tabId) {
+    try {
+      await chrome.storage.local.remove([this._storageKey(tabId)]);
+    } catch (error) {
+      console.error('[DataStore] Error removing conversation:', error);
+    }
+  }
+
+  // Check if tab has any data (for UI to decide whether to show welcome message)
+  hasConversation(tabId) {
+    const t = this._tabs[tabId];
+    return t && t.conversationHistory.length > 0;
+  }
+}
+
+// =============================================================================
+// Global state — View layer only
+// =============================================================================
+const store = new TabDataStore();
+let activeTabId = null;           // currently displayed tab
+let activeStreamEl = null;        // streaming message DOM element in the active tab
+let isFirstChunkAfterStreamStart = false;
 let isFetchingModels = false;
-let lastDebugInfo = { systemContent: '', userText: '' }; // Store last sent context
-let currentTabId = null; // Track current tab for conversation keying
-let streamingMessageId = null; // Track current streaming message
-let streamingMessageElement = null; // DOM element for streaming message
-let streamingContent = ''; // Accumulated streaming content
-let isFirstChunkAfterStreamStart = false; // Flag for first chunk scrolling behavior
-let searchEngines = null; // Search engine registry fetched from background
-let enabledSearchEngines = { bing: true, google: false, baidu: false, wikipedia: false }; // Engine toggles
+let lastDebugInfo = { systemContent: '', userText: '' };
+let searchEngines = null;
+let enabledSearchEngines = { bing: true, google: false, baidu: false, wikipedia: false };
 
 // DOM Elements
 const chatContainer = document.getElementById('chatContainer');
@@ -32,44 +214,224 @@ const toggleConfigBtn = document.getElementById('toggleConfigBtn');
 
 // Provider presets
 const PROVIDERS = {
-  openai: {
-    name: 'OpenAI',
-    endpoint: 'https://api.openai.com/v1/chat/completions',
-    modelsEndpoint: 'https://api.openai.com/v1/models',
-    modelKey: 'id',
-    defaultModel: 'gpt-4o'
-  },
-  deepseek: {
-    name: 'DeepSeek',
-    endpoint: 'https://api.deepseek.com/v1/chat/completions',
-    modelsEndpoint: 'https://api.deepseek.com/v1/models',
-    modelKey: 'id',
-    defaultModel: 'deepseek-chat'
-  },
-  siliconflow: {
-    name: 'SiliconFlow',
-    endpoint: 'https://api.siliconflow.cn/v1/chat/completions',
-    modelsEndpoint: 'https://api.siliconflow.cn/v1/models',
-    modelKey: 'id',
-    defaultModel: 'deepseek-ai/DeepSeek-V2.5'
-  },
-  ollama: {
-    name: 'Ollama',
-    endpoint: 'http://localhost:11434/v1/chat/completions',
-    modelsEndpoint: 'http://localhost:11434/api/tags',
-    modelKey: 'name',
-    defaultModel: 'llama3'
-  },
-  custom: {
-    name: 'Custom',
-    endpoint: '',
-    modelsEndpoint: '',
-    modelKey: 'id',
-    defaultModel: ''
-  }
+  openai: { name: 'OpenAI', endpoint: 'https://api.openai.com/v1/chat/completions', modelsEndpoint: 'https://api.openai.com/v1/models', modelKey: 'id', defaultModel: 'gpt-4o' },
+  deepseek: { name: 'DeepSeek', endpoint: 'https://api.deepseek.com/v1/chat/completions', modelsEndpoint: 'https://api.deepseek.com/v1/models', modelKey: 'id', defaultModel: 'deepseek-chat' },
+  siliconflow: { name: 'SiliconFlow', endpoint: 'https://api.siliconflow.cn/v1/chat/completions', modelsEndpoint: 'https://api.siliconflow.cn/v1/models', modelKey: 'id', defaultModel: 'deepseek-ai/DeepSeek-V2.5' },
+  ollama: { name: 'Ollama', endpoint: 'http://localhost:11434/v1/chat/completions', modelsEndpoint: 'http://localhost:11434/api/tags', modelKey: 'name', defaultModel: 'llama3' },
+  custom: { name: 'Custom', endpoint: '', modelsEndpoint: '', modelKey: 'id', defaultModel: '' }
 };
 
-// Load saved configuration
+// =============================================================================
+// View helpers — pure DOM manipulation
+// =============================================================================
+
+function addMessage(role, content) {
+  const msg = document.createElement('div');
+  msg.className = `message ${role}`;
+  const fontSize = (fontSizeSlider?.value || 12) + 'px';
+
+  if (role === 'assistant' && typeof marked !== 'undefined' && content) {
+    const parsed = marked.parse(content);
+    if (parsed && parsed.trim()) {
+      msg.innerHTML = parsed;
+    } else {
+      msg.textContent = content;
+    }
+  } else {
+    msg.textContent = content || '';
+  }
+
+  msg.style.fontSize = fontSize;
+  chatContainer.appendChild(msg);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function addPlaceholderMessage(text) {
+  const msg = document.createElement('div');
+  msg.className = 'message assistant placeholder-message';
+  msg.textContent = text;
+  chatContainer.appendChild(msg);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function showLoading(show) {
+  loadingIndicator.classList.toggle('active', show);
+}
+
+function restoreInputState() {
+  showLoading(false);
+  sendBtn.style.display = 'block';
+  stopBtn.style.display = 'none';
+  userInput.disabled = false;
+  userInput.focus();
+}
+
+function renderConversation(tabId) {
+  const history = store.getConversation(tabId);
+  history.forEach(msg => {
+    if (msg.role === 'tool') return;
+    if (msg.role === 'assistant' && msg.tool_calls) return;
+    addMessage(msg.role, msg.content);
+  });
+}
+
+// Render or update the streaming message element from the store
+function renderStreamingMessage(tabId) {
+  const streaming = store.getStreaming(tabId);
+  if (!streaming) return;
+
+  const content = streaming.content || '';
+
+  if (streaming.done) {
+    // Finalize streaming into a regular message
+    if (activeStreamEl) {
+      const currentFontSize = fontSizeSlider?.value || 12;
+      if (typeof marked !== 'undefined' && content) {
+        activeStreamEl.innerHTML = marked.parse(content);
+      } else {
+        activeStreamEl.textContent = content || '(已停止生成)';
+      }
+      activeStreamEl.style.fontSize = currentFontSize + 'px';
+      activeStreamEl.classList.remove('streaming');
+      activeStreamEl = null;
+    }
+    store.finalizeStreaming(tabId);
+    store.persist(tabId);
+    restoreInputState();
+    statusEl.textContent = streaming.stopped ? '已停止' : '就绪';
+  } else {
+    // Update or create streaming element
+    if (!activeStreamEl) {
+      activeStreamEl = document.createElement('div');
+      activeStreamEl.className = 'message assistant streaming';
+      chatContainer.appendChild(activeStreamEl);
+      showLoading(true);
+      sendBtn.style.display = 'none';
+      stopBtn.style.display = 'block';
+    }
+
+    const currentFontSize = fontSizeSlider?.value || 12;
+
+    let shouldScrollToBottom;
+    if (isFirstChunkAfterStreamStart) {
+      shouldScrollToBottom = true;
+      isFirstChunkAfterStreamStart = false;
+    } else {
+      const threshold = 50;
+      shouldScrollToBottom = chatContainer.scrollTop + chatContainer.clientHeight >= chatContainer.scrollHeight - threshold;
+    }
+
+    if (typeof marked !== 'undefined' && content) {
+      activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+    } else if (content) {
+      activeStreamEl.textContent = content;
+    } else {
+      activeStreamEl.innerHTML = '<span class="streaming-cursor">▊</span>';
+    }
+    activeStreamEl.style.fontSize = currentFontSize + 'px';
+
+    if (shouldScrollToBottom) {
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+  }
+}
+
+// Switch the view to a different tab — load data from store, render UI
+async function switchToTab(tabId) {
+  if (!tabId) return;
+
+  const prevTabId = activeTabId;
+  const isDifferentTab = prevTabId !== null && prevTabId !== tabId;
+
+  // If switching AWAY from a tab that has an active stream, we DON'T clear
+  // the streaming state in the store — data stays. We just detach the DOM element.
+  if (isDifferentTab) {
+    activeStreamEl = null;
+    isFirstChunkAfterStreamStart = false;
+    restoreInputState();
+  }
+
+  activeTabId = tabId;
+  store.getOrCreate(tabId);
+
+  // Clear UI
+  chatContainer.innerHTML = '';
+  activeStreamEl = null;
+  isFirstChunkAfterStreamStart = false;
+
+  // Load page context from store (memory) — fetch fresh if switching tabs
+  let pageContext = store.getPageContext(tabId);
+  if (isDifferentTab || !pageContext) {
+    statusEl.textContent = '加载页面...';
+    if (pageTitleEl) pageTitleEl.textContent = '正在加载页面内容...';
+    if (pageUrlEl) pageUrlEl.textContent = '';
+    if (contextBanner) contextBanner.style.borderLeft = '3px solid #666';
+
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type: 'GET_PAGE_CONTENT' });
+      if (response && response.content) {
+        store.setPageContext(tabId, response.content);
+        pageContext = response.content;
+      }
+    } catch (error) {
+      // Page may not be injectable — that's OK
+    }
+  }
+
+  // Update header UI
+  if (pageContext) {
+    if (pageTitleEl) pageTitleEl.textContent = pageContext.title || '无标题页面';
+    if (pageUrlEl) pageUrlEl.textContent = pageContext.url;
+    if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
+    statusEl.textContent = '就绪';
+    statusEl.classList.add('ready');
+  } else {
+    if (pageTitleEl) pageTitleEl.textContent = '无法提取页面内容';
+    statusEl.textContent = '页面受限';
+  }
+
+  // Render existing conversation from store
+  if (store.hasConversation(tabId)) {
+    renderConversation(tabId);
+  } else if (!apiKeyInput.value.trim()) {
+    addPlaceholderMessage('👋 你好！请先在顶部配置你的 AI API，然后就可以开始对话了。');
+  }
+
+  // If this tab has a live stream in the store, render it
+  const streaming = store.getStreaming(tabId);
+  if (streaming && !streaming.done) {
+    activeStreamEl = document.createElement('div');
+    activeStreamEl.className = 'message assistant streaming';
+    const currentFontSize = fontSizeSlider?.value || 12;
+    activeStreamEl.style.fontSize = currentFontSize + 'px';
+    const content = streaming.content || '';
+    if (typeof marked !== 'undefined' && content) {
+      activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+    } else if (content) {
+      activeStreamEl.textContent = content;
+    } else {
+      activeStreamEl.innerHTML = '<span class="streaming-cursor">▊</span>';
+    }
+    chatContainer.appendChild(activeStreamEl);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+    showLoading(true);
+    sendBtn.style.display = 'none';
+    stopBtn.style.display = 'block';
+    statusEl.textContent = '接收中...';
+  } else if (streaming && streaming.done) {
+    // Stream completed while we were away — finalize it
+    store.finalizeStreaming(tabId);
+    store.persist(tabId);
+    // Re-render to show the finalized message
+    chatContainer.innerHTML = '';
+    renderConversation(tabId);
+  }
+}
+
+// =============================================================================
+// Config & Provider Logic
+// =============================================================================
+
 async function loadConfig() {
   const result = await chrome.storage.local.get(['provider', 'apiKey', 'model', 'customEndpoint', 'searchEngines']);
   if (result.provider) providerSelect.value = result.provider;
@@ -77,12 +439,10 @@ async function loadConfig() {
   if (result.model) {}
   if (result.customEndpoint) customEndpointInput.value = result.customEndpoint;
 
-  // Load search engine preferences
   if (result.searchEngines) {
     enabledSearchEngines = result.searchEngines;
   }
 
-  // Fetch search engine registry from background
   try {
     const resp = await chrome.runtime.sendMessage({ type: 'GET_SEARCH_ENGINES' });
     if (resp && resp.engines) {
@@ -94,8 +454,6 @@ async function loadConfig() {
 
   customEndpointRow.classList.toggle('show', providerSelect.value === 'custom');
   updateModelSelectState();
-
-  // Initially show config rows
   showConfig();
 
   if (result.provider && result.apiKey) {
@@ -103,7 +461,6 @@ async function loadConfig() {
   }
 }
 
-// Save configuration
 async function saveConfig() {
   await chrome.storage.local.set({
     provider: providerSelect.value,
@@ -113,7 +470,6 @@ async function saveConfig() {
   });
 }
 
-// Update model select state
 function updateModelSelectState() {
   const hasProvider = !!providerSelect.value;
   const hasApiKey = !!apiKeyInput.value.trim();
@@ -132,7 +488,6 @@ function updateModelSelectState() {
   refreshModelsBtn.style.display = hasProvider && hasApiKey && !isCustom ? 'block' : 'none';
 }
 
-// Fetch models from API
 async function fetchModels() {
   const provider = providerSelect.value;
   const apiKey = apiKeyInput.value.trim();
@@ -181,7 +536,6 @@ async function fetchModels() {
 
     statusEl.textContent = '已加载 ' + (response.models?.length || 0) + ' 个模型';
     statusEl.classList.add('ready');
-    // Success - hide config rows after loading models
     hideConfig();
 
   } catch (error) {
@@ -189,7 +543,6 @@ async function fetchModels() {
     statusEl.textContent = '获取模型失败';
     statusEl.classList.add('error');
     modelSelect.innerHTML = '<option value="">-- 获取失败 --</option>';
-    // Failure - show config rows so user can modify and retry
     showConfig();
 
     setTimeout(() => {
@@ -203,8 +556,22 @@ async function fetchModels() {
   }
 }
 
-// Build system content from page context
+function showConfig() {
+  configToggleRow.classList.add('show');
+  toggleConfigBtn.classList.add('active');
+}
+
+function hideConfig() {
+  configToggleRow.classList.remove('show');
+  toggleConfigBtn.classList.remove('active');
+}
+
+// =============================================================================
+// Page Context & Tools
+// =============================================================================
+
 function buildSystemContent() {
+  const pageContext = activeTabId ? store.getPageContext(activeTabId) : null;
   let systemContent = 'You are a helpful AI assistant.';
   if (pageContext) {
     systemContent = `You are an AI assistant helping the user understand a webpage.\n\n`;
@@ -212,7 +579,6 @@ function buildSystemContent() {
     systemContent += `Page URL: ${pageContext.url}\n\n`;
     systemContent += `Page Content:\n${pageContext.text}\n\n`;
 
-    // Add subtitles if available
     if (pageContext.subtitles && pageContext.subtitles.raw) {
       const formattedSubtitles = pageContext.subtitles.raw.map(item => {
         const fromSec = item.from || 0;
@@ -225,7 +591,6 @@ function buildSystemContent() {
       systemContent += `=== Subtitles ===\n${formattedSubtitles}\n\n`;
     }
 
-    // Add comments if available
     if (pageContext.comments && pageContext.comments.length > 0) {
       const commentsStr = pageContext.comments
         .map(c => {
@@ -250,7 +615,6 @@ Use web search when:
 
 Available search tools — use ONLY those listed here:`;
 
-    // List enabled engines
     const enabledEntries = Object.entries(searchEngines || {}).filter(([id]) => enabledSearchEngines[id]);
     const disabledEntries = Object.entries(searchEngines || {}).filter(([id]) => !enabledSearchEngines[id]);
 
@@ -262,9 +626,6 @@ Available search tools — use ONLY those listed here:`;
       systemContent += '\n- No search tools enabled.';
     }
 
-    // Explicitly list disabled engines so the AI knows NOT to use them.
-    // This is critical because conversation history may contain tool_calls from
-    // engines that were previously enabled but are now turned off.
     if (disabledEntries.length > 0) {
       systemContent += '\n\nThe following tools are DISABLED and will return an error if called: ' +
         disabledEntries.map(([id, eng]) => eng.toolName + ' (' + eng.name + ')').join(', ') + '. ' +
@@ -280,444 +641,14 @@ If you run out of searches, answer based on what you already found. If no result
   return systemContent;
 }
 
-// Initialize
-document.addEventListener('DOMContentLoaded', async () => {
-  await loadConfig();
-
-  statusEl.textContent = '加载页面...';
-
-  // Use the background-tracked active content tab (not the sidepanel's own tab)
-  const currentWindow = await chrome.windows.getLastFocused();
-  const resp = await chrome.runtime.sendMessage({
-    type: 'GET_ACTIVE_CONTENT_TAB',
-    windowId: currentWindow.id
-  });
-  currentTabId = resp.tabId;
-
-  if (currentTabId) {
-    try {
-      const response = await chrome.tabs.sendMessage(currentTabId, { type: 'GET_PAGE_CONTENT' });
-
-      if (response && response.content) {
-        pageContext = response.content;
-        if (pageTitleEl) pageTitleEl.textContent = pageContext.title || '无标题页面';
-        if (pageUrlEl) pageUrlEl.textContent = pageContext.url;
-        if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
-        statusEl.textContent = '就绪';
-        statusEl.classList.add('ready');
-      } else {
-        pageContext = null;
-        if (pageTitleEl) pageTitleEl.textContent = '无法提取页面内容';
-        statusEl.textContent = '页面受限';
-      }
-    } catch (error) {
-      pageContext = null;
-      if (pageTitleEl) pageTitleEl.textContent = '无法访问此页面';
-      if (pageUrlEl) pageUrlEl.textContent = error.message;
-      statusEl.textContent = '页面错误';
-    }
-  } else {
-    pageContext = null;
-    if (pageTitleEl) pageTitleEl.textContent = '无可用页面';
-    statusEl.textContent = '无活动页面';
-    if (!apiKeyInput.value.trim()) {
-      addPlaceholderMessage('👋 你好！请先在顶部配置你的 AI API，然后就可以开始对话了。');
-    }
-  }
-
-  // Load saved conversation for this tab
-  if (currentTabId) {
-    const saved = await loadConversation(currentTabId);
-    if (saved && saved.history && saved.history.length > 0) {
-      conversationHistory = saved.history;
-      renderConversation();
-      statusEl.textContent = '已恢复对话';
-      setTimeout(() => {
-        if (statusEl.textContent === '已恢复对话') {
-          statusEl.textContent = '就绪';
-        }
-      }, 2000);
-    } else if (!apiKeyInput.value.trim()) {
-      // No saved conversation, and no API key configured — show welcome message
-      addPlaceholderMessage('👋 你好！请先在顶部配置你的 AI API，然后就可以开始对话了。');
-    }
-
-    // Reconnect to any active stream for this tab (popup was closed/reopened mid-stream)
-    const streamState = await chrome.runtime.sendMessage({
-      type: 'GET_STREAM_STATE',
-      senderTabId: currentTabId
-    }).catch(() => ({ active: false }));
-
-    if (streamState && streamState.active) {
-      console.log('[POPUP] Reconnecting to active stream, messageId:', streamState.messageId, 'content length:', (streamState.content || '').length);
-      streamingMessageId = streamState.messageId;
-      streamingContent = streamState.content || '';
-      isFirstChunkAfterStreamStart = false;
-
-      if (streamState.done) {
-        // Stream already completed - finalize immediately
-        const doneContent = streamState.content || '';
-        const msg = document.createElement('div');
-        msg.className = 'message assistant';
-        const currentFontSize = fontSizeSlider?.value || 12;
-        msg.style.fontSize = currentFontSize + 'px';
-        if (typeof marked !== 'undefined' && doneContent) {
-          msg.innerHTML = marked.parse(doneContent);
-        } else {
-          msg.textContent = doneContent || '(空响应)';
-        }
-        chatContainer.appendChild(msg);
-        chatContainer.scrollTop = chatContainer.scrollHeight;
-        if (doneContent) {
-          conversationHistory.push({ role: 'assistant', content: doneContent });
-        }
-        // Save tool messages (tool results are useful context for follow-up questions)
-        if (streamState.toolMessages && streamState.toolMessages.length > 0) {
-          for (const tm of streamState.toolMessages) {
-            conversationHistory.push(tm);
-          }
-        }
-        saveConversation();
-        streamingMessageId = null;
-        streamingContent = '';
-        isFirstChunkAfterStreamStart = false;
-      } else {
-        // Stream still in progress - show live content with cursor and loading UI
-        streamingMessageElement = document.createElement('div');
-        streamingMessageElement.className = 'message assistant streaming';
-        const currentFontSize = fontSizeSlider?.value || 12;
-        streamingMessageElement.style.fontSize = currentFontSize + 'px';
-        if (typeof marked !== 'undefined' && streamingContent) {
-          streamingMessageElement.innerHTML = marked.parse(streamingContent) + '<span class="streaming-cursor">▊</span>';
-        } else if (streamingContent) {
-          streamingMessageElement.textContent = streamingContent;
-        } else {
-          streamingMessageElement.innerHTML = '<span class="streaming-cursor">▊</span>';
-        }
-        chatContainer.appendChild(streamingMessageElement);
-        chatContainer.scrollTop = chatContainer.scrollHeight;
-        showLoading(true);
-        sendBtn.style.display = 'none';
-        stopBtn.style.display = 'block';
-        statusEl.textContent = '接收中...';
-      }
-    }
-  }
-});
-
-// ============ Streaming Message Handling ============
-
-// Listen for streaming chunks from background.js
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  console.log('[POPUP] Received message type:', request.type, 'senderTabId:', request.senderTabId, 'currentTabId:', currentTabId);
-
-  if (request.type === 'STREAM_START') {
-    // Ignore if not for this tab
-    if (request.senderTabId !== currentTabId) {
-      console.log('[POPUP] STREAM_START ignored - tab mismatch');
-      return;
-    }
-
-    console.log('[POPUP] STREAM_START received, messageId:', request.messageId);
-
-    // If we already have a streaming message for this messageId (reconnect happened), skip
-    if (streamingMessageId === request.messageId && streamingMessageElement) {
-      console.log('[POPUP] STREAM_START skipped - already reconnected to this stream');
-      sendResponse({ received: true });
-      return true;
-    }
-
-    streamingMessageId = request.messageId;
-    streamingContent = ''; // Reset accumulated content
-    isFirstChunkAfterStreamStart = true; // Reset flag for first chunk
-    // Create placeholder message element
-    streamingMessageElement = document.createElement('div');
-    streamingMessageElement.className = 'message assistant streaming';
-    // Apply current font size BEFORE setting innerHTML
-    const currentFontSize = fontSizeSlider?.value || 12;
-    streamingMessageElement.style.fontSize = currentFontSize + 'px';
-    streamingMessageElement.innerHTML = '<span class="streaming-cursor">▊</span>';
-    chatContainer.appendChild(streamingMessageElement);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
-    sendResponse({ received: true });
-    return true;
-  }
-
-  if (request.type === 'STREAM_CHUNK') {
-    // Ignore if not for this tab
-    if (request.senderTabId !== currentTabId) {
-      console.log('[POPUP] STREAM_CHUNK ignored - tab mismatch');
-      return;
-    }
-
-    // Auto-reconnect: if we get a chunk but don't have a streaming message,
-    // it means the popup was reopened mid-stream and hasn't reconnected yet.
-    if (!streamingMessageId || !streamingMessageElement) {
-      console.log('[POPUP] Auto-reconnecting to stream, messageId:', request.messageId);
-      streamingMessageId = request.messageId;
-      streamingContent = request.content || '';
-      isFirstChunkAfterStreamStart = false;
-
-      streamingMessageElement = document.createElement('div');
-      streamingMessageElement.className = 'message assistant streaming';
-      const currentFontSize = fontSizeSlider?.value || 12;
-      streamingMessageElement.style.fontSize = currentFontSize + 'px';
-
-      if (request.done) {
-        // Already done - finalize directly
-        if (typeof marked !== 'undefined' && request.content) {
-          streamingMessageElement.innerHTML = marked.parse(request.content);
-        } else {
-          streamingMessageElement.textContent = request.content || '(空响应)';
-        }
-        streamingMessageElement.classList.remove('streaming');
-        streamingMessageElement = null;
-        if (request.content) {
-          conversationHistory.push({ role: 'assistant', content: request.content });
-        }
-        saveConversation();
-        streamingMessageId = null;
-        streamingContent = '';
-        isFirstChunkAfterStreamStart = false;
-        restoreInputState();
-        sendResponse({ received: true });
-        return true;
-      }
-
-      // Show partial content with cursor
-      if (typeof marked !== 'undefined' && request.content) {
-        streamingMessageElement.innerHTML = marked.parse(request.content) + '<span class="streaming-cursor">▊</span>';
-      } else if (request.content) {
-        streamingMessageElement.textContent = request.content;
-      } else {
-        streamingMessageElement.innerHTML = '<span class="streaming-cursor">▊</span>';
-      }
-      chatContainer.appendChild(streamingMessageElement);
-      chatContainer.scrollTop = chatContainer.scrollHeight;
-      showLoading(true);
-      sendBtn.style.display = 'none';
-      stopBtn.style.display = 'block';
-      sendResponse({ received: true });
-      return true;
-    }
-
-    if (request.messageId !== streamingMessageId) {
-      console.log('[POPUP] STREAM_CHUNK ignored - messageId mismatch', request.messageId, 'vs', streamingMessageId);
-      return;
-    }
-
-    const content = request.content || '';
-    console.log('[POPUP] STREAM_CHUNK received, done:', request.done, 'content length:', content.length);
-
-    if (request.done) {
-      // Stream complete (or stopped by user) - finalize the streaming message
-      if (streamingMessageElement) {
-        const currentFontSize = fontSizeSlider?.value || 12;
-        console.log('[POPUP] Stream done, streamingContent length:', streamingContent.length, 'stopped:', !!request.stopped);
-
-        // Use streamingContent which has the final accumulated content
-        // Render markdown
-        if (typeof marked !== 'undefined' && streamingContent) {
-          streamingMessageElement.innerHTML = marked.parse(streamingContent);
-        } else {
-          streamingMessageElement.textContent = streamingContent || '(已停止生成)';
-        }
-        streamingMessageElement.style.fontSize = currentFontSize + 'px';
-        streamingMessageElement.classList.remove('streaming');
-        streamingMessageElement = null;
-        streamingMessageId = null;
-        isFirstChunkAfterStreamStart = false;
-
-        // Add to conversation history (preserve partial content on stop)
-        if (streamingContent) {
-          conversationHistory.push({ role: 'assistant', content: streamingContent });
-        }
-        // Save tool messages from the stream (assistant tool_calls + tool results)
-        if (request.toolMessages && request.toolMessages.length > 0) {
-          for (const tm of request.toolMessages) {
-            conversationHistory.push(tm);
-          }
-        }
-        saveConversation();
-        streamingContent = ''; // Reset for next stream
-        restoreInputState();
-        statusEl.textContent = request.stopped ? '已停止' : '就绪';
-      }
-    } else {
-      // background.js sends accumulated fullContent, use it directly for display
-      streamingContent = content;
-
-      // Update streaming content - render markdown while streaming
-      if (streamingMessageElement) {
-        const currentFontSize = fontSizeSlider?.value || 12;
-
-        // Check if user is at bottom BEFORE updating content
-        // First chunk after stream start: always scroll to bottom
-        // Subsequent chunks: only scroll if user is already near bottom
-        let shouldScrollToBottom;
-        if (isFirstChunkAfterStreamStart) {
-          shouldScrollToBottom = true;
-          isFirstChunkAfterStreamStart = false;
-        } else {
-          const threshold = 50; // pixels threshold to consider "at bottom"
-          shouldScrollToBottom = chatContainer.scrollTop + chatContainer.clientHeight >= chatContainer.scrollHeight - threshold;
-        }
-
-        // Update content first
-        if (typeof marked !== 'undefined' && content) {
-          streamingMessageElement.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
-        } else {
-          streamingMessageElement.textContent = content;
-        }
-        streamingMessageElement.style.fontSize = currentFontSize + 'px';
-
-        // Then scroll if needed
-        if (shouldScrollToBottom) {
-          chatContainer.scrollTop = chatContainer.scrollHeight;
-        }
-      }
-    }
-    sendResponse({ received: true });
-    return true;
-  }
-
-  if (request.type === 'STREAM_ERROR') {
-    // Ignore if not for this tab
-    if (request.senderTabId !== currentTabId) {
-      console.log('[POPUP] STREAM_ERROR ignored - tab mismatch');
-      return;
-    }
-
-    console.log('[POPUP] STREAM_ERROR received:', request.error);
-    if (streamingMessageElement) {
-      const currentFontSize = fontSizeSlider?.value || 12;
-      streamingMessageElement.innerHTML = `<span class="error">错误: ${request.error || '未知错误'}</span>`;
-      streamingMessageElement.style.fontSize = currentFontSize + 'px';
-      streamingMessageElement.classList.remove('streaming');
-      streamingMessageElement = null;
-    }
-    streamingMessageId = null;
-    streamingContent = ''; // Reset accumulated content
-    isFirstChunkAfterStreamStart = false; // Reset flag
-    conversationHistory.pop(); // Remove the user message since we failed
-    saveConversation();
-    restoreInputState();
-    statusEl.textContent = '就绪';
-    sendResponse({ received: true });
-    return true;
-  }
-});
-
-// Listen for tab switches to update context and conversation
-chrome.tabs.onActivated.addListener(async (activeInfo) => {
-  const { tabId, windowId } = activeInfo;
-
-  // Only handle events for the current extension page's window
-  const currentWindow = await chrome.windows.getLastFocused();
-  if (windowId !== currentWindow.id) return;
-
-  currentTabId = tabId;
-
-  // Clear current UI and load new tab's context
-  chatContainer.innerHTML = '';
-  conversationHistory = [];
-
-  // Refresh page context from new tab
-  statusEl.textContent = '加载页面...';
-  pageContext = null;
-  if (pageTitleEl) pageTitleEl.textContent = '正在加载页面内容...';
-  if (pageUrlEl) pageUrlEl.textContent = '';
-  if (contextBanner) contextBanner.style.borderLeft = '3px solid #666';
-
-  try {
-    const response = await chrome.tabs.sendMessage(tabId, { type: 'GET_PAGE_CONTENT' });
-
-    if (response && response.content) {
-      pageContext = response.content;
-      if (pageTitleEl) pageTitleEl.textContent = pageContext.title || '无标题页面';
-      if (pageUrlEl) pageUrlEl.textContent = pageContext.url;
-      if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
-      statusEl.textContent = '就绪';
-      statusEl.classList.add('ready');
-    } else {
-      if (pageTitleEl) pageTitleEl.textContent = '无法提取页面内容';
-      statusEl.textContent = '页面受限';
-    }
-  } catch (error) {
-    if (pageTitleEl) pageTitleEl.textContent = '无法访问此页面';
-    if (pageUrlEl) pageUrlEl.textContent = error.message;
-    statusEl.textContent = '页面错误';
-  }
-
-  // Load saved conversation for new tab
-  const saved = await loadConversation(tabId);
-  if (saved && saved.history && saved.history.length > 0) {
-    conversationHistory = saved.history;
-    renderConversation();
-  }
-});
-
-// Event listeners for config changes
-providerSelect.addEventListener('change', async () => {
-  customEndpointRow.classList.toggle('show', providerSelect.value === 'custom');
-  updateModelSelectState();
-  await saveConfig();
-
-  if (providerSelect.value && apiKeyInput.value.trim()) {
-    fetchModels();
-  }
-});
-
-apiKeyInput.addEventListener('change', async () => {
-  updateModelSelectState();
-  await saveConfig();
-
-  if (providerSelect.value && apiKeyInput.value.trim()) {
-    fetchModels();
-  }
-});
-
-customEndpointInput.addEventListener('change', async () => {
-  await saveConfig();
-});
-
-modelSelect.addEventListener('change', async () => {
-  await saveConfig();
-});
-
-refreshModelsBtn.addEventListener('click', () => {
-  fetchModels();
-});
-
-// Toggle config visibility
-// Show/Hide config functions
-function showConfig() {
-  configToggleRow.classList.add('show');
-  toggleConfigBtn.classList.add('active');
-}
-
-function hideConfig() {
-  configToggleRow.classList.remove('show');
-  toggleConfigBtn.classList.remove('active');
-}
-
-toggleConfigBtn.addEventListener('click', () => {
-  if (configToggleRow.classList.contains('show')) {
-    hideConfig();
-  } else {
-    showConfig();
-  }
-});
-
-// Fetch fresh page context from the current content tab
 async function refreshPageContext() {
-  if (!currentTabId) return false;
+  if (!activeTabId) return false;
   try {
-    const response = await chrome.tabs.sendMessage(currentTabId, { type: 'GET_PAGE_CONTENT' });
+    const response = await chrome.tabs.sendMessage(activeTabId, { type: 'GET_PAGE_CONTENT' });
     if (response && response.content) {
-      pageContext = response.content;
-      if (pageTitleEl) pageTitleEl.textContent = pageContext.title || '无标题页面';
-      if (pageUrlEl) pageUrlEl.textContent = pageContext.url;
+      store.setPageContext(activeTabId, response.content);
+      if (pageTitleEl) pageTitleEl.textContent = response.content.title || '无标题页面';
+      if (pageUrlEl) pageUrlEl.textContent = response.content.url;
       if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
       return true;
     }
@@ -727,7 +658,6 @@ async function refreshPageContext() {
   return false;
 }
 
-// Build tool definitions based on enabled search engines
 function buildSearchTools() {
   if (!searchEngines) return [];
 
@@ -755,7 +685,10 @@ function buildSearchTools() {
   return tools;
 }
 
-// Send message
+// =============================================================================
+// Send / Stop Stream
+// =============================================================================
+
 async function sendMessage() {
   const text = userInput.value.trim();
   if (!text) return;
@@ -765,32 +698,19 @@ async function sendMessage() {
   const model = modelSelect.value;
   const customEndpoint = customEndpointInput.value.trim();
 
-  if (!provider) {
-    addMessage('error', '请先选择一个 AI 提供商。');
-    return;
-  }
+  if (!provider) { addMessage('error', '请先选择一个 AI 提供商。'); return; }
+  if (!apiKey) { addMessage('error', '请先填写 API Key。'); return; }
+  if (!model && provider !== 'custom') { addMessage('error', '请先选择一个模型，或手动输入模型名称。'); return; }
 
-  if (!apiKey) {
-    addMessage('error', '请先填写 API Key。');
-    return;
-  }
-
-  if (!model && provider !== 'custom') {
-    addMessage('error', '请先选择一个模型，或手动输入模型名称。');
-    return;
-  }
-
-  // Store for debug
   const userText = text;
 
-  // Clear placeholder message on first real message
   const placeholder = chatContainer.querySelector('.placeholder-message');
   if (placeholder) placeholder.remove();
 
   addMessage('user', text);
   userInput.value = '';
-  conversationHistory.push({ role: 'user', content: text });
-  await saveConversation();
+  store.appendMessage(activeTabId, { role: 'user', content: text });
+  await store.persist(activeTabId);
 
   showLoading(true);
   sendBtn.style.display = 'none';
@@ -798,145 +718,415 @@ async function sendMessage() {
   statusEl.textContent = '刷新页面内容...';
 
   try {
-    // Refresh page context before sending
     await refreshPageContext();
     statusEl.textContent = '发送中...';
 
-    // Build system content and store for debug
     const systemContent = buildSystemContent();
     lastDebugInfo = { systemContent, userText };
 
     const messages = [
       { role: 'system', content: systemContent },
-      ...conversationHistory
+      ...store.getConversation(activeTabId)
     ];
 
     const actualModel = model || (provider === 'custom' ? 'custom-model' : '');
     const config = { provider, apiKey, model: actualModel, customEndpoint };
-
-    // Include tool definitions for enabled search engines
     const tools = buildSearchTools();
 
-    // Send request - for streaming, we don't wait for response here
-    // The streaming chunks will come back via chrome.runtime.onMessage
     chrome.runtime.sendMessage({
       type: 'SEND_TO_AI',
       config,
       messages,
       tools,
-      senderTabId: currentTabId
+      senderTabId: activeTabId
     }).catch(error => {
       addMessage('error', `错误: ${error.message}`);
       restoreInputState();
-      conversationHistory.pop();
-      saveConversation();
+      store.getConversation(activeTabId).pop();
+      store.persist(activeTabId);
       statusEl.textContent = '就绪';
     });
 
   } catch (error) {
     addMessage('error', `错误: ${error.message}`);
-    conversationHistory.pop();
-    await saveConversation();
+    store.getConversation(activeTabId).pop();
+    await store.persist(activeTabId);
     statusEl.textContent = '就绪';
-  } finally {
-    // Don't hide loading here - wait for stream to complete
   }
 }
 
-// Restore input state after streaming completes or is stopped
-function restoreInputState() {
-  showLoading(false);
-  sendBtn.style.display = 'block';
-  stopBtn.style.display = 'none';
-  userInput.disabled = false;
-  userInput.focus();
-}
-
-// Stop the current AI stream
 function stopStream() {
-  if (!streamingMessageId) return;
+  const streaming = store.getStreaming(activeTabId);
+  if (!streaming || !streaming.messageId) return;
 
-  console.log('[POPUP] User requested stop stream for tab:', currentTabId);
+  console.log('[POPUP] User requested stop stream for tab:', activeTabId);
   statusEl.textContent = '正在停止...';
 
-  // Send stop message to background to abort the fetch
   chrome.runtime.sendMessage({
     type: 'STOP_STREAM',
-    senderTabId: currentTabId
+    senderTabId: activeTabId
   }).catch(() => {});
 
-  // Finalize the current streaming message locally with accumulated content
-  if (streamingMessageElement) {
+  // Finalize locally
+  if (activeStreamEl) {
     const currentFontSize = fontSizeSlider?.value || 12;
-
-    if (typeof marked !== 'undefined' && streamingContent) {
-      streamingMessageElement.innerHTML = marked.parse(streamingContent);
+    const content = streaming.content || '';
+    if (typeof marked !== 'undefined' && content) {
+      activeStreamEl.innerHTML = marked.parse(content);
     } else {
-      streamingMessageElement.textContent = streamingContent || '(已停止生成)';
+      activeStreamEl.textContent = content || '(已停止生成)';
     }
-    streamingMessageElement.style.fontSize = currentFontSize + 'px';
-    streamingMessageElement.classList.remove('streaming');
-    streamingMessageElement = null;
+    activeStreamEl.style.fontSize = currentFontSize + 'px';
+    activeStreamEl.classList.remove('streaming');
+    activeStreamEl = null;
   }
 
-  // Add partial content to conversation history
-  if (streamingContent) {
-    conversationHistory.push({ role: 'assistant', content: streamingContent });
-    saveConversation();
-  }
-
-  streamingMessageId = null;
-  streamingContent = '';
+  store.finalizeStreaming(activeTabId);
+  store.persist(activeTabId);
   isFirstChunkAfterStreamStart = false;
   restoreInputState();
   statusEl.textContent = '已停止';
 }
 
-// Add a placeholder message (UI only, not in conversation history — won't affect AI attention)
-function addPlaceholderMessage(text) {
-  const msg = document.createElement('div');
-  msg.className = 'message assistant placeholder-message';
-  msg.textContent = text;
-  chatContainer.appendChild(msg);
-  chatContainer.scrollTop = chatContainer.scrollHeight;
-}
+// =============================================================================
+// Initialization (DOMContentLoaded)
+// =============================================================================
 
-// ============ Add Message ============
-function addMessage(role, content) {
-  const msg = document.createElement('div');
-  msg.className = `message ${role}`;
-  const fontSize = (fontSizeSlider?.value || 12) + 'px';
+document.addEventListener('DOMContentLoaded', async () => {
+  await loadConfig();
 
-  if (role === 'assistant' && typeof marked !== 'undefined' && content) {
-    const parsed = marked.parse(content);
-    // Only use parsed content if it's not empty
-    if (parsed && parsed.trim()) {
-      msg.innerHTML = parsed;
-    } else {
-      msg.textContent = content;
+  statusEl.textContent = '加载页面...';
+
+  // Get the active content tab (not the extension page itself)
+  const currentWindow = await chrome.windows.getLastFocused();
+  const resp = await chrome.runtime.sendMessage({
+    type: 'GET_ACTIVE_CONTENT_TAB',
+    windowId: currentWindow.id
+  });
+  const initialTabId = resp.tabId;
+
+  if (initialTabId) {
+    // Load conversation from storage into store
+    await store.load(initialTabId);
+
+    // Fetch page context
+    try {
+      const response = await chrome.tabs.sendMessage(initialTabId, { type: 'GET_PAGE_CONTENT' });
+      if (response && response.content) {
+        store.setPageContext(initialTabId, response.content);
+        if (pageTitleEl) pageTitleEl.textContent = response.content.title || '无标题页面';
+        if (pageUrlEl) pageUrlEl.textContent = response.content.url;
+        if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
+        statusEl.textContent = '就绪';
+        statusEl.classList.add('ready');
+      } else {
+        if (pageTitleEl) pageTitleEl.textContent = '无法提取页面内容';
+        statusEl.textContent = '页面受限';
+      }
+    } catch (error) {
+      if (pageTitleEl) pageTitleEl.textContent = '无法访问此页面';
+      if (pageUrlEl) pageUrlEl.textContent = error.message;
+      statusEl.textContent = '页面错误';
+    }
+
+    // Set active tab BEFORE rendering (renderConversation uses activeTabId)
+    activeTabId = initialTabId;
+
+    if (store.hasConversation(initialTabId)) {
+      renderConversation(initialTabId);
+      statusEl.textContent = '已恢复对话';
+      setTimeout(() => {
+        if (statusEl.textContent === '已恢复对话') {
+          statusEl.textContent = '就绪';
+        }
+      }, 2000);
+    } else if (!apiKeyInput.value.trim()) {
+      addPlaceholderMessage('👋 你好！请先在顶部配置你的 AI API，然后就可以开始对话了。');
+    }
+
+    // Reconnect to any active stream (popup closed/reopened mid-stream)
+    const streamState = await chrome.runtime.sendMessage({
+      type: 'GET_STREAM_STATE',
+      senderTabId: initialTabId
+    }).catch(() => ({ active: false }));
+
+    if (streamState && streamState.active) {
+      console.log('[POPUP] Reconnecting to active stream, messageId:', streamState.messageId, 'content length:', (streamState.content || '').length);
+      store.startStreaming(initialTabId, streamState.messageId);
+      store.updateStreamContent(initialTabId, streamState.content || '');
+      if (streamState.done) {
+        store.updateStreamDone(initialTabId, true);
+        if (streamState.toolMessages) {
+          store.updateStreamToolMessages(initialTabId, streamState.toolMessages);
+        }
+        store.finalizeStreaming(initialTabId);
+        store.persist(initialTabId);
+        // Re-render to show finalized message
+        chatContainer.innerHTML = '';
+        renderConversation(initialTabId);
+      } else {
+        // Show live content with cursor
+        activeStreamEl = document.createElement('div');
+        activeStreamEl.className = 'message assistant streaming';
+        const currentFontSize = fontSizeSlider?.value || 12;
+        activeStreamEl.style.fontSize = currentFontSize + 'px';
+        const content = streamState.content || '';
+        if (typeof marked !== 'undefined' && content) {
+          activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+        } else if (content) {
+          activeStreamEl.textContent = content;
+        } else {
+          activeStreamEl.innerHTML = '<span class="streaming-cursor">▊</span>';
+        }
+        chatContainer.appendChild(activeStreamEl);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        showLoading(true);
+        sendBtn.style.display = 'none';
+        stopBtn.style.display = 'block';
+        statusEl.textContent = '接收中...';
+      }
     }
   } else {
-    msg.textContent = content || '';
+    activeTabId = initialTabId;
+    if (pageTitleEl) pageTitleEl.textContent = '无可用页面';
+    statusEl.textContent = '无活动页面';
+    if (!apiKeyInput.value.trim()) {
+      addPlaceholderMessage('👋 你好！请先在顶部配置你的 AI API，然后就可以开始对话了。');
+    }
+  }
+});
+
+// =============================================================================
+// Streaming Message Handling (chrome.runtime.onMessage)
+// =============================================================================
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  console.log('[POPUP] Received message type:', request.type, 'senderTabId:', request.senderTabId, 'activeTabId:', activeTabId);
+
+  const msgTabId = request.senderTabId;
+  const isActive = msgTabId === activeTabId;
+
+  if (request.type === 'STREAM_START') {
+    console.log('[POPUP] STREAM_START received, messageId:', request.messageId);
+
+    // Always update store regardless of whether this tab is active
+    store.startStreaming(msgTabId, request.messageId);
+
+    if (isActive) {
+      // If already have a streaming element (reconnect), skip
+      if (activeStreamEl && store.getStreaming(msgTabId)) {
+        console.log('[POPUP] STREAM_START skipped - already have streaming element');
+        sendResponse({ received: true });
+        return true;
+      }
+
+      isFirstChunkAfterStreamStart = true;
+      activeStreamEl = document.createElement('div');
+      activeStreamEl.className = 'message assistant streaming';
+      const currentFontSize = fontSizeSlider?.value || 12;
+      activeStreamEl.style.fontSize = currentFontSize + 'px';
+      activeStreamEl.innerHTML = '<span class="streaming-cursor">▊</span>';
+      chatContainer.appendChild(activeStreamEl);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+    sendResponse({ received: true });
+    return true;
   }
 
-  msg.style.fontSize = fontSize;
-  chatContainer.appendChild(msg);
-  chatContainer.scrollTop = chatContainer.scrollHeight;
-}
+  if (request.type === 'STREAM_CHUNK') {
+    const content = request.content || '';
 
-// Show/hide loading
-function showLoading(show) {
-  loadingIndicator.classList.toggle('active', show);
-}
+    // Always update store — data survives tab switches
+    store.updateStreamContent(msgTabId, content);
+    if (request.done) {
+      store.updateStreamDone(msgTabId, true);
+    }
+    if (request.toolMessages && request.toolMessages.length > 0) {
+      store.updateStreamToolMessages(msgTabId, request.toolMessages);
+    }
 
-// Event listeners
+    if (request.done) {
+      // Stream complete — finalize in store regardless
+      store.finalizeStreaming(msgTabId);
+      store.persist(msgTabId);
+
+      if (isActive) {
+        // Finalize DOM
+        if (activeStreamEl) {
+          const currentFontSize = fontSizeSlider?.value || 12;
+          if (typeof marked !== 'undefined' && content) {
+            activeStreamEl.innerHTML = marked.parse(content);
+          } else {
+            activeStreamEl.textContent = content || '(已停止生成)';
+          }
+          activeStreamEl.style.fontSize = currentFontSize + 'px';
+          activeStreamEl.classList.remove('streaming');
+          activeStreamEl = null;
+        }
+        isFirstChunkAfterStreamStart = false;
+        restoreInputState();
+        statusEl.textContent = request.stopped ? '已停止' : '就绪';
+      }
+      sendResponse({ received: true });
+      return true;
+    }
+
+    // In-progress chunk — only update DOM if this is the active tab
+    if (isActive) {
+      // Auto-reconnect: if we get a chunk but don't have a streaming element
+      if (!activeStreamEl) {
+        console.log('[POPUP] Auto-reconnecting to stream, messageId:', request.messageId);
+        isFirstChunkAfterStreamStart = false;
+
+        activeStreamEl = document.createElement('div');
+        activeStreamEl.className = 'message assistant streaming';
+        const currentFontSize = fontSizeSlider?.value || 12;
+        activeStreamEl.style.fontSize = currentFontSize + 'px';
+
+        if (typeof marked !== 'undefined' && content) {
+          activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+        } else if (content) {
+          activeStreamEl.textContent = content;
+        } else {
+          activeStreamEl.innerHTML = '<span class="streaming-cursor">▊</span>';
+        }
+        chatContainer.appendChild(activeStreamEl);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        showLoading(true);
+        sendBtn.style.display = 'none';
+        stopBtn.style.display = 'block';
+        sendResponse({ received: true });
+        return true;
+      }
+
+      // Normal in-progress update
+      if (activeStreamEl) {
+        const currentFontSize = fontSizeSlider?.value || 12;
+
+        let shouldScrollToBottom;
+        if (isFirstChunkAfterStreamStart) {
+          shouldScrollToBottom = true;
+          isFirstChunkAfterStreamStart = false;
+        } else {
+          const threshold = 50;
+          shouldScrollToBottom = chatContainer.scrollTop + chatContainer.clientHeight >= chatContainer.scrollHeight - threshold;
+        }
+
+        if (typeof marked !== 'undefined' && content) {
+          activeStreamEl.innerHTML = marked.parse(content) + '<span class="streaming-cursor">▊</span>';
+        } else {
+          activeStreamEl.textContent = content;
+        }
+        activeStreamEl.style.fontSize = currentFontSize + 'px';
+
+        if (shouldScrollToBottom) {
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+      }
+    }
+    // else: chunk is for a non-active tab — store already updated, UI will
+    // pick it up when user switches back to this tab
+
+    sendResponse({ received: true });
+    return true;
+  }
+
+  if (request.type === 'STREAM_ERROR') {
+    console.log('[POPUP] STREAM_ERROR received:', request.error);
+
+    if (isActive) {
+      if (activeStreamEl) {
+        const currentFontSize = fontSizeSlider?.value || 12;
+        activeStreamEl.innerHTML = `<span class="error">错误: ${request.error || '未知错误'}</span>`;
+        activeStreamEl.style.fontSize = currentFontSize + 'px';
+        activeStreamEl.classList.remove('streaming');
+        activeStreamEl = null;
+      }
+      isFirstChunkAfterStreamStart = false;
+      store.getConversation(msgTabId).pop(); // Remove failed user message
+      store.persist(msgTabId);
+      restoreInputState();
+      statusEl.textContent = '就绪';
+    }
+    // Clear streaming state for this tab regardless
+    if (store.getStreaming(msgTabId)) {
+      store.getConversation(msgTabId).pop();
+      store._ensure(msgTabId).streaming = null;
+    }
+
+    sendResponse({ received: true });
+    return true;
+  }
+});
+
+// =============================================================================
+// Tab Switch Handling (chrome.tabs.onActivated)
+// =============================================================================
+
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  const { tabId, windowId } = activeInfo;
+
+  // Only handle events for this extension page's window
+  const currentWindow = await chrome.windows.getLastFocused();
+  if (windowId !== currentWindow.id) return;
+
+  // Load from storage if we haven't seen this tab yet
+  if (!store.getPageContext(tabId) && !store.hasConversation(tabId)) {
+    await store.load(tabId);
+  }
+
+  // Switch the view to this tab (data stays in store)
+  await switchToTab(tabId);
+});
+
+// =============================================================================
+// Event Listeners
+// =============================================================================
+
+providerSelect.addEventListener('change', async () => {
+  customEndpointRow.classList.toggle('show', providerSelect.value === 'custom');
+  updateModelSelectState();
+  await saveConfig();
+  if (providerSelect.value && apiKeyInput.value.trim()) {
+    fetchModels();
+  }
+});
+
+apiKeyInput.addEventListener('change', async () => {
+  updateModelSelectState();
+  await saveConfig();
+  if (providerSelect.value && apiKeyInput.value.trim()) {
+    fetchModels();
+  }
+});
+
+customEndpointInput.addEventListener('change', async () => {
+  await saveConfig();
+});
+
+modelSelect.addEventListener('change', async () => {
+  await saveConfig();
+});
+
+refreshModelsBtn.addEventListener('click', () => {
+  fetchModels();
+});
+
+toggleConfigBtn.addEventListener('click', () => {
+  if (configToggleRow.classList.contains('show')) {
+    hideConfig();
+  } else {
+    showConfig();
+  }
+});
+
 sendBtn.addEventListener('click', sendMessage);
 stopBtn.addEventListener('click', stopStream);
 userInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    // If streaming, Enter stops it; otherwise sends
-    if (streamingMessageId) {
+    const streaming = store.getStreaming(activeTabId);
+    if (streaming && streaming.messageId) {
       stopStream();
     } else {
       sendMessage();
@@ -944,61 +1134,15 @@ userInput.addEventListener('keydown', (e) => {
   }
 });
 
-// Auto-resize textarea
 userInput.addEventListener('input', () => {
   userInput.style.height = 'auto';
   userInput.style.height = Math.min(userInput.scrollHeight, 100) + 'px';
 });
 
-// ============ Conversation Persistence ============
+// =============================================================================
+// Debug Modal
+// =============================================================================
 
-// Get storage key for current tab
-function getConversationKey() {
-  return `conversation_${currentTabId}`;
-}
-
-// Save conversation history to storage
-async function saveConversation() {
-  if (!currentTabId) return;
-  try {
-    const key = getConversationKey();
-    await chrome.storage.local.set({
-      [key]: {
-        history: conversationHistory,
-        pageContext: pageContext,
-        savedAt: Date.now()
-      }
-    });
-  } catch (error) {
-    console.error('Error saving conversation:', error);
-  }
-}
-
-// Load conversation history from storage
-async function loadConversation(tabId) {
-  try {
-    const key = `conversation_${tabId}`;
-    const result = await chrome.storage.local.get([key]);
-    if (result[key]) {
-      return result[key];
-    }
-  } catch (error) {
-    console.error('Error loading conversation:', error);
-  }
-  return null;
-}
-
-// Render existing conversation messages
-function renderConversation() {
-  conversationHistory.forEach(msg => {
-    // Skip tool-call and tool-result messages — they're for AI context only
-    if (msg.role === 'tool') return;
-    if (msg.role === 'assistant' && msg.tool_calls) return;
-    addMessage(msg.role, msg.content);
-  });
-}
-
-// ============ Debug Modal ============
 const debugModal = document.getElementById('debugModal');
 const debugContent = document.getElementById('debugContent');
 const debugBtn = document.getElementById('debugBtn');
@@ -1015,9 +1159,7 @@ function hideDebugModal() {
 }
 
 debugBtn.addEventListener('click', () => {
-  // First refresh page context
   refreshPageContext().then(() => {
-    // Update with fresh context
     lastDebugInfo.systemContent = buildSystemContent();
     lastDebugInfo.userText = userInput.value.trim() || '(无输入)';
     showDebugModal();
@@ -1026,31 +1168,35 @@ debugBtn.addEventListener('click', () => {
 
 debugClose.addEventListener('click', hideDebugModal);
 
-// Close modal when clicking outside content
 debugModal.addEventListener('click', (e) => {
   if (e.target === debugModal) {
     hideDebugModal();
   }
 });
 
-// ============ Clear Conversation ============
+// =============================================================================
+// Clear Conversation
+// =============================================================================
+
 const clearBtn = document.getElementById('clearBtn');
 
 clearBtn.addEventListener('click', async () => {
-  if (conversationHistory.length === 0) return;
+  if (!store.hasConversation(activeTabId)) return;
 
   if (confirm('确定要清空当前对话记录吗？')) {
-    conversationHistory = [];
+    store.clearConversation(activeTabId);
     chatContainer.innerHTML = '';
     addMessage('assistant', '对话已清空。');
-    await chrome.storage.local.remove([getConversationKey()]);
+    await store.removePersisted(activeTabId);
   }
 });
 
-// ============ Font Size Control ============
+// =============================================================================
+// Font Size Control
+// =============================================================================
+
 const fontSizeSlider = document.getElementById('fontSizeSlider');
 const fontSizeValue = document.getElementById('fontSizeValue');
-const chatMessages = document.querySelectorAll('.message');
 
 async function loadFontSize() {
   const result = await chrome.storage.local.get(['fontSize']);
@@ -1077,12 +1223,12 @@ fontSizeSlider.addEventListener('change', async () => {
   await chrome.storage.local.set({ fontSize: fontSizeSlider.value });
 });
 
-// Initialize font size on load
 loadFontSize();
 
-// ============ Search Engine Toggles ============
+// =============================================================================
+// Search Engine Toggles
+// =============================================================================
 
-// Apply saved engine toggles to checkbox state
 function applySearchEngineToggles() {
   document.querySelectorAll('.engine-toggle input[type="checkbox"]').forEach(cb => {
     const engineId = cb.dataset.engine;
@@ -1092,12 +1238,10 @@ function applySearchEngineToggles() {
   });
 }
 
-// Save search engine toggles
 async function saveSearchEngineToggles() {
   await chrome.storage.local.set({ searchEngines: enabledSearchEngines });
 }
 
-// Attach change handlers to all engine toggle checkboxes
 document.querySelectorAll('.engine-toggle input[type="checkbox"]').forEach(cb => {
   cb.addEventListener('change', async () => {
     const engineId = cb.dataset.engine;
@@ -1109,11 +1253,9 @@ document.querySelectorAll('.engine-toggle input[type="checkbox"]').forEach(cb =>
   });
 });
 
-// Apply toggles after DOM is loaded and config is fetched
 if (searchEngines) {
   applySearchEngineToggles();
 } else {
-  // Retry after a short delay if searchEngines hasn't loaded yet
   setTimeout(() => {
     if (searchEngines) applySearchEngineToggles();
   }, 1000);
