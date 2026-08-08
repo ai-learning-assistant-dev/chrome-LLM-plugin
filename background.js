@@ -243,7 +243,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         active: true,
         messageId: session.messageId,
         content: session.content,
-        done: session.done
+        done: session.done,
+        toolMessages: session.toolMessages || []
       });
     } else {
       sendResponse({ active: false });
@@ -594,7 +595,7 @@ async function processStreamResponse(response, endpoint, config, messages, tools
 
   // Send initial "start" event and initialize stream session
   console.log('[DEBUG] Sending STREAM_START, senderTabId:', senderTabId);
-  streamSessions[senderTabId] = { messageId, content: '', done: false, stopped: false };
+  streamSessions[senderTabId] = { messageId, content: '', done: false, stopped: false, toolMessages: [] };
   setTimeout(() => {
     chrome.runtime.sendMessage({
       type: 'STREAM_START',
@@ -1009,7 +1010,11 @@ async function processStreamResponse(response, endpoint, config, messages, tools
       }
     }
 
-    // Send final done chunk
+    // Send final done chunk with tool messages
+    const toolMessages = followUpMessages ? followUpMessages.slice(messages.length) : [];
+    if (streamSessions[senderTabId]) {
+      streamSessions[senderTabId].toolMessages = toolMessages;
+    }
     setTimeout(() => {
       if (streamSessions[senderTabId]) {
         streamSessions[senderTabId].done = true;
@@ -1020,7 +1025,8 @@ async function processStreamResponse(response, endpoint, config, messages, tools
         messageId,
         content: fullContent,
         done: true,
-        senderTabId
+        senderTabId,
+        toolMessages: toolMessages
       }).catch(e => console.error('[DEBUG] Failed to send final STREAM_CHUNK:', e));
     }, 100);
   }

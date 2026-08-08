@@ -320,6 +320,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (doneContent) {
           conversationHistory.push({ role: 'assistant', content: doneContent });
         }
+        // Save tool messages from the completed stream (assistant tool_calls + tool results)
+        if (streamState.toolMessages && streamState.toolMessages.length > 0) {
+          for (const tm of streamState.toolMessages) {
+            conversationHistory.push(tm);
+          }
+        }
         saveConversation();
         streamingMessageId = null;
         streamingContent = '';
@@ -474,6 +480,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // Add to conversation history (preserve partial content on stop)
         if (streamingContent) {
           conversationHistory.push({ role: 'assistant', content: streamingContent });
+        }
+        // Save tool messages from the stream (assistant tool_calls + tool results)
+        if (request.toolMessages && request.toolMessages.length > 0) {
+          for (const tm of request.toolMessages) {
+            conversationHistory.push(tm);
+          }
         }
         saveConversation();
         streamingContent = ''; // Reset for next stream
@@ -903,6 +915,9 @@ async function loadConversation(tabId) {
 // Render existing conversation messages
 function renderConversation() {
   conversationHistory.forEach(msg => {
+    // Skip tool-call and tool-result messages — they're for AI context only
+    if (msg.role === 'tool') return;
+    if (msg.role === 'assistant' && msg.tool_calls) return;
     addMessage(msg.role, msg.content);
   });
 }
