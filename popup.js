@@ -19,6 +19,7 @@ const stopBtn = document.getElementById('stopBtn');
 const statusEl = document.getElementById('status');
 const pageTitleEl = document.getElementById('pageTitle');
 const pageUrlEl = document.getElementById('pageUrl');
+const contextBanner = document.getElementById('contextBanner');
 const loadingIndicator = document.getElementById('loadingIndicator');
 const apiKeyInput = document.getElementById('apiKey');
 const providerSelect = document.getElementById('providerSelect');
@@ -299,26 +300,29 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (response && response.content) {
         pageContext = response.content;
-        pageTitleEl.textContent = pageContext.title || '无标题页面';
-        pageUrlEl.textContent = pageContext.url;
-        document.getElementById('contextBanner').style.borderLeft = '3px solid #4ade80';
+        if (pageTitleEl) pageTitleEl.textContent = pageContext.title || '无标题页面';
+        if (pageUrlEl) pageUrlEl.textContent = pageContext.url;
+        if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
         statusEl.textContent = '就绪';
         statusEl.classList.add('ready');
       } else {
         pageContext = null;
-        pageTitleEl.textContent = '无法提取页面内容';
+        if (pageTitleEl) pageTitleEl.textContent = '无法提取页面内容';
         statusEl.textContent = '页面受限';
       }
     } catch (error) {
       pageContext = null;
-      pageTitleEl.textContent = '无法访问此页面';
-      pageUrlEl.textContent = error.message;
+      if (pageTitleEl) pageTitleEl.textContent = '无法访问此页面';
+      if (pageUrlEl) pageUrlEl.textContent = error.message;
       statusEl.textContent = '页面错误';
     }
   } else {
     pageContext = null;
-    pageTitleEl.textContent = '无可用页面';
+    if (pageTitleEl) pageTitleEl.textContent = '无可用页面';
     statusEl.textContent = '无活动页面';
+    if (!apiKeyInput.value.trim()) {
+      addPlaceholderMessage('👋 你好！请先在顶部配置你的 AI API，然后就可以开始对话了。');
+    }
   }
 
   // Load saved conversation for this tab
@@ -333,6 +337,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           statusEl.textContent = '就绪';
         }
       }, 2000);
+    } else if (!apiKeyInput.value.trim()) {
+      // No saved conversation, and no API key configured — show welcome message
+      addPlaceholderMessage('👋 你好！请先在顶部配置你的 AI API，然后就可以开始对话了。');
     }
 
     // Reconnect to any active stream for this tab (popup was closed/reopened mid-stream)
@@ -618,27 +625,27 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   // Refresh page context from new tab
   statusEl.textContent = '加载页面...';
   pageContext = null;
-  pageTitleEl.textContent = '正在加载页面内容...';
-  pageUrlEl.textContent = '';
-  document.getElementById('contextBanner').style.borderLeft = '3px solid #666';
+  if (pageTitleEl) pageTitleEl.textContent = '正在加载页面内容...';
+  if (pageUrlEl) pageUrlEl.textContent = '';
+  if (contextBanner) contextBanner.style.borderLeft = '3px solid #666';
 
   try {
     const response = await chrome.tabs.sendMessage(tabId, { type: 'GET_PAGE_CONTENT' });
 
     if (response && response.content) {
       pageContext = response.content;
-      pageTitleEl.textContent = pageContext.title || '无标题页面';
-      pageUrlEl.textContent = pageContext.url;
-      document.getElementById('contextBanner').style.borderLeft = '3px solid #4ade80';
+      if (pageTitleEl) pageTitleEl.textContent = pageContext.title || '无标题页面';
+      if (pageUrlEl) pageUrlEl.textContent = pageContext.url;
+      if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
       statusEl.textContent = '就绪';
       statusEl.classList.add('ready');
     } else {
-      pageTitleEl.textContent = '无法提取页面内容';
+      if (pageTitleEl) pageTitleEl.textContent = '无法提取页面内容';
       statusEl.textContent = '页面受限';
     }
   } catch (error) {
-    pageTitleEl.textContent = '无法访问此页面';
-    pageUrlEl.textContent = error.message;
+    if (pageTitleEl) pageTitleEl.textContent = '无法访问此页面';
+    if (pageUrlEl) pageUrlEl.textContent = error.message;
     statusEl.textContent = '页面错误';
   }
 
@@ -709,9 +716,9 @@ async function refreshPageContext() {
     const response = await chrome.tabs.sendMessage(currentTabId, { type: 'GET_PAGE_CONTENT' });
     if (response && response.content) {
       pageContext = response.content;
-      pageTitleEl.textContent = pageContext.title || '无标题页面';
-      pageUrlEl.textContent = pageContext.url;
-      document.getElementById('contextBanner').style.borderLeft = '3px solid #4ade80';
+      if (pageTitleEl) pageTitleEl.textContent = pageContext.title || '无标题页面';
+      if (pageUrlEl) pageUrlEl.textContent = pageContext.url;
+      if (contextBanner) contextBanner.style.borderLeft = '3px solid #4ade80';
       return true;
     }
   } catch (error) {
@@ -775,6 +782,10 @@ async function sendMessage() {
 
   // Store for debug
   const userText = text;
+
+  // Clear placeholder message on first real message
+  const placeholder = chatContainer.querySelector('.placeholder-message');
+  if (placeholder) placeholder.remove();
 
   addMessage('user', text);
   userInput.value = '';
@@ -879,6 +890,15 @@ function stopStream() {
   isFirstChunkAfterStreamStart = false;
   restoreInputState();
   statusEl.textContent = '已停止';
+}
+
+// Add a placeholder message (UI only, not in conversation history — won't affect AI attention)
+function addPlaceholderMessage(text) {
+  const msg = document.createElement('div');
+  msg.className = 'message assistant placeholder-message';
+  msg.textContent = text;
+  chatContainer.appendChild(msg);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
 // ============ Add Message ============
