@@ -86,7 +86,6 @@ async function loadConfig() {
     const resp = await chrome.runtime.sendMessage({ type: 'GET_SEARCH_ENGINES' });
     if (resp && resp.engines) {
       searchEngines = resp.engines;
-      // Apply saved toggles to checkbox state later (after DOM is fully loaded)
     }
   } catch (e) {
     console.error('Failed to fetch search engines:', e);
@@ -240,17 +239,7 @@ function buildSystemContent() {
 
     systemContent += `Please answer the user's questions based on this content. Be helpful and concise.
 
-You have access to web search tools (up to 3 uses total per response). Available search engines: `;
-
-    // List available engines
-    const availableEngines = Object.entries(searchEngines || {}).filter(([id]) => enabledSearchEngines[id]);
-    if (availableEngines.length > 0) {
-      systemContent += availableEngines.map(([id, eng]) => eng.name).join(', ') + '.';
-    } else {
-      systemContent += 'None enabled.';
-    }
-
-    systemContent += `
+You have access to web search tools (up to 3 uses total per response).
 
 Use web search when:
 - The user asks you to verify/fact-check information
@@ -258,11 +247,30 @@ Use web search when:
 - The user explicitly asks you to search for something
 - You are uncertain about a claim and need to verify it
 
-Choose the most appropriate search engine for the query type:
-- ` + (searchEngines && searchEngines.bing ? 'web_search: General web search via Bing for broad English-language queries' : '') + `
-- ` + (searchEngines && searchEngines.google ? 'web_search_google: Google search, good for English queries and broad coverage' : '') + `
-- ` + (searchEngines && searchEngines.baidu ? 'web_search_baidu: Baidu (百度), best for Chinese-language content, news, and local China information' : '') + `
-- ` + (searchEngines && searchEngines.wikipedia ? 'web_search_wikipedia: Wikipedia, best for encyclopedic articles, definitions, and factual background' : '') + `
+Available search tools — use ONLY those listed here:`;
+
+    // List enabled engines
+    const enabledEntries = Object.entries(searchEngines || {}).filter(([id]) => enabledSearchEngines[id]);
+    const disabledEntries = Object.entries(searchEngines || {}).filter(([id]) => !enabledSearchEngines[id]);
+
+    if (enabledEntries.length > 0) {
+      for (const [id, eng] of enabledEntries) {
+        systemContent += '\n- ' + eng.toolName + ': ' + eng.toolDescription;
+      }
+    } else {
+      systemContent += '\n- No search tools enabled.';
+    }
+
+    // Explicitly list disabled engines so the AI knows NOT to use them.
+    // This is critical because conversation history may contain tool_calls from
+    // engines that were previously enabled but are now turned off.
+    if (disabledEntries.length > 0) {
+      systemContent += '\n\nThe following tools are DISABLED and will return an error if called: ' +
+        disabledEntries.map(([id, eng]) => eng.toolName + ' (' + eng.name + ')').join(', ') + '. ' +
+        'DO NOT call these — pick from the available tools above instead.';
+    }
+
+    systemContent += `
 
 Search results include titles, URLs, and snippets. Use these to provide accurate, up-to-date answers with source citations.
 
@@ -356,7 +364,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (doneContent) {
           conversationHistory.push({ role: 'assistant', content: doneContent });
         }
-        // Save tool messages from the completed stream (assistant tool_calls + tool results)
+        // Save tool messages (tool results are useful context for follow-up questions)
         if (streamState.toolMessages && streamState.toolMessages.length > 0) {
           for (const tm of streamState.toolMessages) {
             conversationHistory.push(tm);

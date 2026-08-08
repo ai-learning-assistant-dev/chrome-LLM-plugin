@@ -50,7 +50,7 @@ const SEARCH_ENGINES = {
     name: 'Bing',
     searchUrl: (q) => 'https://www.bing.com/search?q=' + encodeURIComponent(q),
     extractMessage: 'EXTRACT_BING_RESULTS',
-    toolName: 'web_search',
+    toolName: 'web_search_bing',
     toolDescription: 'Search the web using Bing to get real-time information, verify facts, or find current data. Use this when the user asks for general web search, information that may not be in the page content, needs verification, or requires up-to-date data.',
     searchUrlTemplate: 'https://www.bing.com/search?q={query}',
     timeoutMs: 15000
@@ -889,11 +889,13 @@ async function processStreamResponse(response, endpoint, config, messages, tools
           });
         }
       } else {
-        // Unknown tool
+        // Unknown tool — likely a search engine that was disabled.
+        // Don't list specific engines (we don't know which are enabled here).
+        // The AI should pick from the tools provided in the current request.
         toolResults.push({
           tool_call_id: toolCall.id,
           role: 'tool',
-          content: '未知工具: ' + toolCall.name
+          content: '工具 "' + toolCall.name + '" 当前不可用。请从你当前收到的可用工具列表中选择另一个搜索引擎重试。'
         });
       }
     }
@@ -1086,6 +1088,14 @@ async function processStreamResponse(response, endpoint, config, messages, tools
                   content: (engine ? engine.name : '搜索') + '出错: ' + e.message
                 });
               }
+            } else {
+              // Unknown tool — likely a disabled search engine.
+              // The AI should pick from the tools provided in the current request.
+              followUpMessages.push({
+                tool_call_id: tc.id,
+                role: 'tool',
+                content: '工具 "' + tc.name + '" 当前不可用。请从你当前收到的可用工具列表中选择另一个搜索引擎重试。'
+              });
             }
           }
           // Continue loop for next round
